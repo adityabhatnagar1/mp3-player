@@ -1,20 +1,28 @@
 /*
  * Retro 128x64 OLED Audio Visualizer
- * Milestone 02 - synthetic animated spectrum
+ * Milestone 03 - PCM5102A I2S DAC (440 Hz test tone) + synthetic spectrum
  *
- * Hardware (verified):
+ * Hardware:
  *   ESP32-WROOM-32 DevKit V1
  *   M130-12864-B-4V 1.3" OLED, SH1106, 0x3C
- *   SDA = GPIO21, SCL = GPIO22
- *   U8g2 full framebuffer, hardware I2C
+ *     SDA = GPIO21, SCL = GPIO22, U8g2 full framebuffer, hardware I2C
+ *   PCM5102A breakout (3-wire I2S, SCK tied to GND)
+ *     BCK = GPIO27, LCK = GPIO25, DIN = GPIO26   (see audio_out.h)
  *
- * No audio hardware and no FFT yet. Signal data is synthesised.
- * No delay(), no dynamic allocation, no floating point.
+ * Visualizer code below is unchanged from Milestone 02.
+ * Audio runs entirely in its own FreeRTOS task on core 0 (audio_out.cpp);
+ * loop()/OLED rendering runs on core 1 and never touches I2S.
+ *
+ * Test tone control:
+ *   - Serial monitor (115200): 't' toggle, '1' on, '0' off
+ *   - BOOT button (GPIO0) on the DevKit: press to toggle
  */
 
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+
+#include "audio_out.h"
 
 // -----------------------------------------------------------------------------
 // Verified hardware configuration
@@ -22,6 +30,11 @@
 static constexpr uint8_t SDA_PIN  = 21;
 static constexpr uint8_t SCL_PIN  = 22;
 static constexpr uint8_t I2C_ADDR = 0x3C;
+
+// Test tone: start enabled at boot? (toggle at runtime with 't' or BOOT button)
+static constexpr bool    TONE_ON_AT_BOOT = true;
+static constexpr uint8_t BOOT_BTN_PIN    = 0;     // DevKit BOOT button, active low
+static constexpr uint32_t BTN_DEBOUNCE_MS = 30;
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
@@ -94,11 +107,19 @@ static const uint8_t BEAT_GAIN[NUM_BANDS] = {
 // -----------------------------------------------------------------------------
 static void updateVisualizer();
 static void renderFrame();
+static void pollAudioControls(uint32_t now);
+static void announceMode();
 
 // -----------------------------------------------------------------------------
 // Setup
+// Order: Serial -> OLED (unchanged M02 path) -> first frame -> I2S/audio task.
+// OLED comes first so the display is already up if audio init fails.
 // -----------------------------------------------------------------------------
 void setup() {
+    Serial.begin(115200);
+
+    pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
 
@@ -118,20 +139,86 @@ void setup() {
     updateVisualizer();
     renderFrame();
     lastFrame = millis();
+
+    // --- Audio (Milestone 03) ---
+    if (audio::begin()) {
+    audio::setMode(audio::MODE_SCALE);   // play scale on boot
+    Serial.println(F("[audio] I2S OK - playing scale"));
+    announceMode();
+    } else {
+        Serial.println(F("[audio] ERROR: I2S init failed (display continues)"));
+    }
+
+    Serial.println(F("[audio] 's'=scale '1'=440Hz '0'=off 't'=toggle, BOOT=cycle modes"));
 }
 
 // -----------------------------------------------------------------------------
-// Non-blocking frame scheduler
+// Non-blocking frame scheduler (unchanged) + non-blocking tone controls
 // -----------------------------------------------------------------------------
 void loop() {
     const uint32_t now = millis();
+
+    pollAudioControls(now);   // was pollToneControls(now)
+
     if ((uint32_t)(now - lastFrame) < FRAME_INTERVAL_MS) {
         return;
     }
     lastFrame = now;
 
+    // Generate a 1 Hz sine wave for the Serial Plotter based on uptime
+    float plotterSine = sin(now * 2.0 * PI / 1000.0) * 100.0;
+    Serial.println(plotterSine);
+
     updateVisualizer();
     renderFrame();
+}
+
+// -----------------------------------------------------------------------------
+// Tone controls: serial characters and BOOT button (debounced, no delay())
+// -----------------------------------------------------------------------------
+static void announceMode() {
+    Serial.print(F("[audio] mode: "));
+    switch (audio::mode()) {
+        case audio::MODE_OFF:   Serial.println(F("OFF"));      break;
+        case audio::MODE_TONE:  Serial.println(F("440 Hz"));   break;
+        case audio::MODE_SCALE: Serial.println(F("SCALE"));    break;
+    }
+}
+
+static void pollAudioControls(uint32_t now) {
+    while (Serial.available() > 0) {
+        const int c = Serial.read();
+        if      (c == 's' || c == 'S') { audio::setMode(audio::MODE_SCALE); announceMode(); }
+        else if (c == '1')             { audio::setMode(audio::MODE_TONE);  announceMode(); }
+        else if (c == '0')             { audio::setMode(audio::MODE_OFF);   announceMode(); }
+        else if (c == 't' || c == 'T') {
+            audio::setMode(audio::mode() == audio::MODE_TONE ? audio::MODE_OFF
+                                                             : audio::MODE_TONE);
+            announceMode();
+        } else if (c == 'e' || c == 'E') {
+            Serial.print(F("[audio] i2s write errors: "));
+            Serial.println(audio::writeErrors());
+        }
+    }
+
+    // BOOT button: OFF -> TONE -> SCALE -> OFF
+    static bool     lastRaw   = true;
+    static bool     stable    = true;
+    static uint32_t changedAt = 0;
+    const bool raw = digitalRead(BOOT_BTN_PIN) != LOW;
+    if (raw != lastRaw) {
+        lastRaw   = raw;
+        changedAt = now;
+    } else if (raw != stable && (uint32_t)(now - changedAt) >= BTN_DEBOUNCE_MS) {
+        stable = raw;
+        if (!stable) {
+            const auto m = audio::mode();
+            if      (m == audio::MODE_OFF)   audio::setMode(audio::MODE_TONE);
+            else if (m == audio::MODE_TONE)  audio::setMode(audio::MODE_SCALE);
+            else                              audio::setMode(audio::MODE_OFF);
+            announceMode();
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
