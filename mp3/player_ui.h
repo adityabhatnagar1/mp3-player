@@ -31,11 +31,13 @@ public:
     void setScreen(UIScreen s);
     void setAutoMode(bool enabled);
     UIScreen currentScreen() const { return screen_; }
+    bool bootFinished() const { return screen_ != UIScreen::BOOT; }
 
 private:
     uint32_t overlayVolMs_ = 0;
     uint32_t overlayPlayPauseMs_ = 0;
     uint8_t  lastVol_ = 70;
+    float    dispVol_ = 70.0f;          // eased copy of lastVol_, drives every volume graphic
     bool     overlayPlaying_ = false;
 
     void drawOverlays();
@@ -44,6 +46,7 @@ private:
     UIScreen screen_ = UIScreen::BOOT;
     bool autoMode_   = true;
     bool searching_  = false;
+    bool firstFrame_ = true;            // boot clock starts at the first *rendered* frame
 
     uint32_t screenEnteredMs_ = 0;
     uint32_t lastRenderMs_    = 0;
@@ -76,7 +79,9 @@ private:
     void drawStatusBar(bool paused);
     void drawMascot(int x, int y, uint8_t face, bool sway);
     void drawBluetoothIcon(int x, int y, uint32_t now);
-    void drawPlayPauseIcon(int x, int y, bool playing);
+    void drawVolumeMeter(int x, int y);
+    void drawStarfield(uint32_t now, int yMin, int yMax);
+    void drawWaves(uint32_t now, int baseY, float amp);
     void drawVisualizer(int baseY, int maxH, bool active, uint32_t now);
     void drawMarquee(int x, int baseline, int availW,
                      const char* text, int16_t w, float scroll,
@@ -84,7 +89,7 @@ private:
     uint8_t pickFace(uint32_t now) const;
     void drawEntryWipe();
 
-    static const uint8_t mascot_[8][32];
+    static const uint8_t mascot_[8][72];   // 24x24, 3 bytes/row
 };
 
 #endif

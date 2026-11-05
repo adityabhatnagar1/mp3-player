@@ -2,6 +2,7 @@
 #include "audio_out.h"
 
 #include <string.h>
+#include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "BluetoothA2DPSink.h"
@@ -16,15 +17,27 @@ volatile bool g_connected = false;
 volatile bool g_paused = false;
 volatile bool g_metaDirty = false;
 
+// Volume the phone asked for (0..100), -1 = nothing pending. Written on the BT task,
+// consumed by poll() on the main loop.
+std::atomic<int> g_phoneVol{-1};
+
 char g_title[96]  = {0};
 char g_artist[64] = {0};
 
 // Called on the Bluetooth task for each decoded SBC frame.
+// Registered as the RAW stream reader: PCM arrives *before* the library applies its own
+// volume, so audio_out.cpp's g_volume is the only gain stage (no double attenuation).
 void dataCallback(const uint8_t* data, uint32_t length) {
-    // Defensive: the library should already deliver frame-aligned data.
     if (length < 4) return;
     length -= length % 4;                    // stereo 16-bit = 4 bytes/frame
     audio::btWrite(data, length);
+}
+
+// Called on the BT task when the PHONE moves its volume slider (AVRCP absolute volume, 0..127).
+void volumeCallback(int v127) {
+    if (v127 < 0) v127 = 0;
+    if (v127 > 127) v127 = 127;
+    g_phoneVol.store((v127 * 100 + 63) / 127);
 }
 
 // Called on the BT task for A2DP connection-state changes.
@@ -76,7 +89,6 @@ void setVolume(uint8_t vol) {
     }
 }
 
-
 bool begin() {
     if (g_sink) return true;
 
@@ -86,8 +98,10 @@ bool begin() {
     g_sink = new BluetoothA2DPSink();
     if (!g_sink) { vSemaphoreDelete(g_metaMutex); g_metaMutex = nullptr; return false; }
 
-    // false = do NOT install the library's internal I2S driver.
-    g_sink->set_stream_reader(dataCallback, false);
+    // No internal I2S driver, no post-volume reader; PCM comes through the raw reader.
+    g_sink->set_stream_reader(nullptr, false);
+    g_sink->set_raw_stream_reader(dataCallback);
+    g_sink->set_avrc_rn_volumechange(volumeCallback);
     g_sink->set_on_connection_state_changed(connectionCallback);
     g_sink->set_avrc_metadata_callback(metadataCallback);
     g_sink->set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE |
@@ -106,6 +120,7 @@ Snapshot poll() {
     Snapshot s;
     s.connected       = g_connected;
     s.metadataChanged = false;
+    s.phoneVolume     = (int8_t)g_phoneVol.exchange(-1);
     s.title[0]        = 0;
     s.artist[0]       = 0;
     if (g_metaMutex && xSemaphoreTake(g_metaMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -122,6 +137,7 @@ Snapshot poll() {
     return s;
 }
 
+bool connected() { return g_connected; }
 bool isPaused() { return g_paused; }
 void pause()    { if (g_sink) { g_sink->pause(); g_paused = true;  } }
 void resume()   { if (g_sink) { g_sink->play();  g_paused = false; } }
