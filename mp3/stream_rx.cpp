@@ -96,9 +96,17 @@ void onHello(const proto::FrameParser::Frame& f) {
 }
 
 void onData(const proto::FrameParser::Frame& f) {
-    if (audio::streamStatus().state == audio::STREAM_IDLE) return;     // no session: ignore stray data
-    if (f.len == 0 || (f.len % g_frameBytes) != 0) { bumpError(proto::ERR_BAD_DATA); return; }
-    if (!audio::streamWrite(f.payload, f.len))      { bumpError(proto::ERR_OVERFLOW); }
+    if (audio::streamStatus().state == audio::STREAM_IDLE) return; // no session: ignore stray data
+    if (audio::btActive()) return; // BT owns the pipeline
+
+    if (f.len == 0 || (f.len % g_frameBytes) != 0) {
+        bumpError(proto::ERR_BAD_DATA);
+        return;
+    }
+
+    if (!audio::streamWrite(f.payload, f.len)) {
+        bumpError(proto::ERR_OVERFLOW);
+    }
 }
 
 void onFrame(const proto::FrameParser::Frame& f) {

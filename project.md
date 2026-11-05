@@ -7,7 +7,12 @@
 │   ├── audio_levels.h
 │   ├── audio_out.cpp
 │   ├── audio_out.h
+│   ├── bt_audio.cpp
+│   ├── bt_audio.h
 │   ├── mp3.ino
+│   ├── player_ui.cpp
+│   ├── player_ui.h
+│   ├── source_manager.h
 │   ├── stream_player.cpp
 │   ├── stream_player.h
 │   ├── stream_proto.cpp
@@ -35,6 +40,7 @@
     │       └── tools
     │           └── list_ports.py
     ├── test_levels.cpp
+    ├── test_ownership.cpp
     └── test_proto.cpp
 ````
 
@@ -168,6 +174,7 @@ class BandAnalyzer {
 
 #include <math.h>
 #include <string.h>
+#include <atomic>
 
 #include "driver/i2s.h"
 #include "freertos/FreeRTOS.h"
@@ -197,21 +204,17 @@ constexpr int TABLE_BITS = 10;
 constexpr int TABLE_SIZE = 1 << TABLE_BITS;
 int16_t sineTable[TABLE_SIZE];
 
-// Sine table peak = -18 dBFS (same level as before)
 constexpr int16_t SINE_PEAK = 4096;
 
-// ---- Notes (equal temperament, A4 = 440, C4 .. C6) ----
 static const uint16_t NOTE_HZ[] = {
-    262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494, // C4..B4
-    523, 554, 587, 622, 659, 698, 740, 784, 831, 880, 932, 988, // C5..B5
-    1047                                                         // C6
+    262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494,
+    523, 554, 587, 622, 659, 698, 740, 784, 831, 880, 932, 988,
+    1047
 };
 static constexpr uint8_t NOTE_REST = 0xFF;
 
 struct Step { uint8_t note; uint16_t ms; };
 
-// C major scale up, then back down, then a short rest.
-// note: index into NOTE_HZ, or NOTE_REST for silence.
 static const Step SCALE[] = {
     { 0, 180}, { 2, 180}, { 4, 180}, { 5, 180},
     { 7, 180}, { 9, 180}, {11, 180}, {12, 420},
@@ -223,22 +226,17 @@ constexpr uint8_t SEQ_LEN = sizeof(SCALE) / sizeof(SCALE[0]);
 
 constexpr uint32_t TONE_HZ = 440;
 
-// ---- Envelope constants ----
-constexpr int32_t  ENV_MAX         = 32767;   // Q15 1.0
-constexpr uint32_t ATTACK_SAMPLES  = 88;      // ~2 ms
-constexpr uint32_t FADEOUT_SAMPLES = 110;     // ~2.5 ms
+constexpr int32_t  ENV_MAX         = 32767;
+constexpr uint32_t ATTACK_SAMPLES  = 88;
+constexpr uint32_t FADEOUT_SAMPLES = 110;
 constexpr int32_t  ATTACK_STEP     = ENV_MAX / (int32_t)ATTACK_SAMPLES;
 constexpr int32_t  FADEOUT_STEP    = ENV_MAX / (int32_t)FADEOUT_SAMPLES;
+constexpr int32_t  DECAY_COEFF     = 32765;
 
-// Exponential decay coefficient (Q15 per-sample multiply).
-// tau = 250 ms -> coeff = 32768 * exp(-1 / (0.250 * 44100)) ~= 32765
-constexpr int32_t  DECAY_COEFF = 32765;
-
-// ---- Commands: any task -> audio task (the audio task owns I2S + all playback state) ----
 enum CmdType : uint8_t { CMD_SET_MODE, CMD_STREAM_START, CMD_STREAM_END, CMD_STREAM_ABORT };
 struct Cmd {
     uint8_t  type;
-    uint8_t  arg;       // Mode for CMD_SET_MODE, channel count for CMD_STREAM_START
+    uint8_t  arg;
     uint16_t session;
     uint32_t rate;
 };
@@ -249,12 +247,19 @@ volatile Mode     g_mode        = MODE_OFF;
 volatile uint32_t g_writeErrors = 0;
 volatile uint32_t g_vizStampMs  = 0;
 bool              g_started     = false;
-uint32_t          g_i2sRate     = SAMPLE_RATE_HZ;   // audio task only
+uint32_t          g_i2sRate     = SAMPLE_RATE_HZ;
+
+// --- ownership --------------------------------------------------------------
+SourceManager g_source;
+constexpr uint16_t BT_SESSION = 0x0000;   // reserved
+
+// --- pending sample-rate from BT -------------------------------------------
+std::atomic<uint32_t> g_pendingRate{0};
 
 int16_t g_chunk[CHUNK_FRAMES * 2];
 
-sp::StreamPlayer       g_player;     // ring buffer lives here (static, never allocated at run time)
-viz::BandAnalyzer   g_analyzer;
+sp::StreamPlayer       g_player;
+viz::BandAnalyzer     g_analyzer;
 
 inline int16_t sineLookup(uint32_t phase) {
     const uint32_t idx  = phase >> (32 - TABLE_BITS);
@@ -268,7 +273,6 @@ inline uint32_t phaseIncFor(uint32_t hz) {
     return (uint32_t)(((uint64_t)hz << 32) / SAMPLE_RATE_HZ);
 }
 
-// Audio task only.
 void setClock(uint32_t rate) {
     if (rate == g_i2sRate) return;
     i2s_zero_dma_buffer(I2S_PORT);
@@ -276,25 +280,33 @@ void setClock(uint32_t rate) {
     g_i2sRate = rate;
 }
 
-// Audio task only.
 void handleCommand(const Cmd& c) {
     switch (c.type) {
         case CMD_SET_MODE:
-            if (g_mode == MODE_STREAM) break;            // generators never run over a stream
+            if (g_mode == MODE_STREAM) break;
             if (c.arg != (uint8_t)MODE_STREAM) {
-                setClock(SAMPLE_RATE_HZ);                // synth phase increments assume 44.1 kHz
+                setClock(SAMPLE_RATE_HZ);
                 g_mode = (Mode)c.arg;
             }
             break;
 
-        case CMD_STREAM_START:
-            i2s_zero_dma_buffer(I2S_PORT);
-            setClock(c.rate);
-            g_analyzer.reset(c.rate);
-            g_vizStampMs = 0;
-            g_player.start(c.rate, c.arg, c.session);
-            g_mode = MODE_STREAM;
-            break;
+        case CMD_STREAM_START: {
+        uint32_t rate = c.rate;
+
+        if (c.session == BT_SESSION) {
+            uint32_t pr = g_pendingRate.exchange(0);
+            if (pr != 0) rate = pr;
+        }
+
+        i2s_zero_dma_buffer(I2S_PORT);
+        setClock(rate);
+        g_analyzer.reset(rate);
+        g_vizStampMs = 0;
+        g_player.start(rate, c.arg, c.session);
+        g_source.setReady(true);           // producer may now write
+        g_mode = MODE_STREAM;
+        break;
+        }
 
         case CMD_STREAM_END:
             g_player.end();
@@ -302,7 +314,7 @@ void handleCommand(const Cmd& c) {
 
         case CMD_STREAM_ABORT:
             g_player.abort();
-            i2s_zero_dma_buffer(I2S_PORT);               // cut off what is already in the DMA queue
+            i2s_zero_dma_buffer(I2S_PORT);
             break;
     }
 }
@@ -310,6 +322,16 @@ void handleCommand(const Cmd& c) {
 bool post(const Cmd& c) {
     if (!g_started || g_cmdQ == nullptr) return false;
     return xQueueSend(g_cmdQ, &c, 0) == pdTRUE;
+}
+
+bool streamBeginInternal(uint32_t rateHz, uint8_t channels, uint16_t session) {
+    if (rateHz < 8000 || rateHz > 48000 || channels < 1 || channels > 2) return false;
+    Cmd c = {};
+    c.type    = CMD_STREAM_START;
+    c.arg     = channels;
+    c.session = session;
+    c.rate    = rateHz;
+    return post(c);
 }
 
 void audioTask(void*) {
@@ -328,10 +350,16 @@ void audioTask(void*) {
         Cmd cmd;
         while (xQueueReceive(g_cmdQ, &cmd, 0) == pdTRUE) handleCommand(cmd);
 
+        // Apply pending sample-rate change (from BT) on the audio task only.
+        const uint32_t pending = g_pendingRate.exchange(0);
+        if (pending != 0 && pending != g_i2sRate) {
+            setClock(pending);
+            g_analyzer.reset(pending);
+        }
+
         const Mode m = g_mode;
 
         if (m == MODE_STREAM) {
-            // ---------------- streamed PCM (no synthesis runs) ----------------
             if (lastMode != MODE_STREAM) {
                 env = 0; fadeRemaining = 0; attackRemaining = 0; noteRemaining = 0;
                 envAttacking = false; pendingAdvance = false; phaseInc = 0;
@@ -339,106 +367,79 @@ void audioTask(void*) {
             }
             const int valid = g_player.render(g_chunk, CHUNK_FRAMES);
             if (valid > 0 && g_analyzer.feed(g_chunk, valid)) g_vizStampMs = millis();
-            if (g_player.idle()) g_mode = MODE_OFF;       // finished, aborted or timed out
+            if (g_player.idle()) {
+                g_source.release();                 // audio task confirms shutdown
+                g_mode = MODE_OFF;
+            }
         } else {
-            // ---------------- built-in generators (unchanged from Milestone 03) ----------------
-
-            // ---- Mode change ----
+            // generators (unchanged from original)
             if (m != lastMode) {
                 if (m == MODE_TONE) {
-                    phase           = 0;
-                    phaseInc        = phaseIncFor(TONE_HZ);
-                    env             = 0;
-                    attackRemaining = ATTACK_SAMPLES;
-                    envAttacking    = true;
-                    fadeRemaining   = 0;
-                    noteRemaining   = 0;
-                    pendingAdvance  = false;
+                    phase = 0; phaseInc = phaseIncFor(TONE_HZ);
+                    env = 0; attackRemaining = ATTACK_SAMPLES; envAttacking = true;
+                    fadeRemaining = 0; noteRemaining = 0; pendingAdvance = false;
                 } else if (m == MODE_SCALE) {
-                    seqPos = 0;
-                    const Step& s = SCALE[0];
-                    phase      = 0;
-                    phaseInc   = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
-                    env        = 0;
-                    envAttacking = (s.note != NOTE_REST);
+                    seqPos = 0; const Step& s = SCALE[0];
+                    phase = 0;
+                    phaseInc = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
+                    env = 0; envAttacking = (s.note != NOTE_REST);
                     attackRemaining = envAttacking ? ATTACK_SAMPLES : 0;
                     fadeRemaining = 0;
                     noteRemaining = (uint32_t)s.ms * SAMPLE_RATE_HZ / 1000;
                     pendingAdvance = false;
-                } else { // MODE_OFF
+                } else {
                     if (env > 0) fadeRemaining = FADEOUT_SAMPLES;
-                    pendingAdvance = false;
-                    noteRemaining  = 0;
-                    envAttacking   = false;
+                    pendingAdvance = false; noteRemaining = 0; envAttacking = false;
                 }
                 lastMode = m;
             }
 
-            // ---- Sample generation ----
             for (int i = 0; i < CHUNK_FRAMES; ++i) {
-
-                // Envelope state machine
                 if (fadeRemaining > 0) {
-                    env -= FADEOUT_STEP;
-                    --fadeRemaining;
+                    env -= FADEOUT_STEP; --fadeRemaining;
                     if (env <= 0 || fadeRemaining == 0) {
-                        env = 0;
-                        fadeRemaining = 0;
+                        env = 0; fadeRemaining = 0;
                         if (pendingAdvance) {
                             pendingAdvance = false;
                             const Step& s = SCALE[seqPos];
                             phase    = 0;
                             phaseInc = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
                             if (s.note != NOTE_REST) {
-                                env = 0;
-                                attackRemaining = ATTACK_SAMPLES;
-                                envAttacking = true;
-                            } else {
-                                envAttacking = false;
-                            }
+                                env = 0; attackRemaining = ATTACK_SAMPLES; envAttacking = true;
+                            } else { envAttacking = false; }
                             noteRemaining = (uint32_t)s.ms * SAMPLE_RATE_HZ / 1000;
-                        } else if (m == MODE_OFF) {
-                            phaseInc = 0;
-                        }
+                        } else if (m == MODE_OFF) { phaseInc = 0; }
                     }
                 } else if (envAttacking) {
-                    env += ATTACK_STEP;
-                    --attackRemaining;
+                    env += ATTACK_STEP; --attackRemaining;
                     if (attackRemaining == 0 || env >= ENV_MAX) {
-                        env = ENV_MAX;
-                        envAttacking = false;
+                        env = ENV_MAX; envAttacking = false;
                     }
                 } else if (env > 0) {
-                    if (m == MODE_SCALE) {          // piano-style decay
+                    if (m == MODE_SCALE) {
                         env = (env * DECAY_COEFF) >> 15;
                         if (env < 16) env = 0;
                     }
-                    // MODE_TONE: hold env at ENV_MAX (steady tone)
                 }
 
-                // Note timer (SCALE only)
                 if (m == MODE_SCALE && noteRemaining > 0) {
                     if (--noteRemaining == 0) {
                         seqPos = (uint8_t)((seqPos + 1) % SEQ_LEN);
-                        pendingAdvance = true;
-                        fadeRemaining  = FADEOUT_SAMPLES;
+                        pendingAdvance = true; fadeRemaining = FADEOUT_SAMPLES;
                     }
                 }
 
-                // Output
                 int16_t out = 0;
                 if (env > 0 && phaseInc != 0) {
                     const int32_t s = sineLookup(phase);
                     out = (int16_t)((s * env) >> 15);
                 }
                 phase += phaseInc;
-
                 g_chunk[2*i]     = out;
                 g_chunk[2*i + 1] = out;
             }
         }
 
-        // Blocks until a DMA buffer is free: this is what paces the whole loop.
         size_t written = 0;
         const esp_err_t err = i2s_write(I2S_PORT, g_chunk, sizeof(g_chunk),
                                         &written, portMAX_DELAY);
@@ -487,7 +488,7 @@ bool begin() {
     }
     i2s_zero_dma_buffer(I2S_PORT);
 
-    g_started = true;    // set before the task starts so commands posted right away are accepted
+    g_started = true;
     if (xTaskCreatePinnedToCore(audioTask, "audio", 6144, nullptr, 5, nullptr, 0) != pdPASS) {
         g_started = false;
         i2s_driver_uninstall(I2S_PORT);
@@ -497,27 +498,34 @@ bool begin() {
 }
 
 void setMode(Mode m) {
-    Cmd c = {};
-    c.type = CMD_SET_MODE;
-    c.arg  = (uint8_t)m;
-    post(c);
+    Cmd c = {}; c.type = CMD_SET_MODE; c.arg = (uint8_t)m; post(c);
 }
 Mode mode()            { return g_mode; }
 uint32_t writeErrors() { return g_writeErrors; }
 
 bool streamBegin(uint32_t rateHz, uint8_t channels, uint16_t session) {
-    if (rateHz < 8000 || rateHz > 48000 || channels < 1 || channels > 2) return false;
-    Cmd c = {};
-    c.type    = CMD_STREAM_START;
-    c.arg     = channels;
-    c.session = session;
-    c.rate    = rateHz;
-    return post(c);
+    if (!g_source.acquire(Source::SERIAL)) return false;
+    if (!streamBeginInternal(rateHz, channels, session)) {
+        g_source.release();
+        return false;
+    }
+    return true;
 }
-void streamEnd()   { Cmd c = {}; c.type = CMD_STREAM_END;   post(c); }
-void streamAbort() { Cmd c = {}; c.type = CMD_STREAM_ABORT; post(c); }
 
-bool streamWrite(const uint8_t* data, uint32_t len) { return g_player.write(data, len); }
+void streamEnd() {
+    if (g_source.owner() != Source::SERIAL) return;
+    Cmd c = {}; c.type = CMD_STREAM_END; post(c);
+}
+
+void streamAbort() {
+    if (g_source.owner() != Source::SERIAL) return;
+    Cmd c = {}; c.type = CMD_STREAM_ABORT; post(c);
+}
+
+bool streamWrite(const uint8_t* data, uint32_t len) {
+    if (g_source.owner() != Source::SERIAL) return false;
+    return g_player.write(data, len);
+}
 
 StreamStatus streamStatus() {
     const sp::Status s = g_player.status();
@@ -530,11 +538,44 @@ StreamStatus streamStatus() {
     return out;
 }
 
+// ---- Bluetooth ------------------------------------------------------------
+bool btBegin() {
+    if (!g_source.acquire(Source::BLUETOOTH)) return false;
+    // The actual rate is supplied by btSetSampleRate(); start with 44100 default.
+    if (!streamBeginInternal(44100, 2, BT_SESSION)) {
+        g_source.release();
+        return false;
+    }
+    return true;
+}
+
+void btEnd() {
+    if (g_source.owner() != Source::BLUETOOTH) return;
+
+    g_pendingRate.store(0);  // drop any rate scheduled by this session
+
+    Cmd c = {};
+    c.type = CMD_STREAM_END;
+    post(c);
+}
+
+bool btWrite(const uint8_t* data, uint32_t len) {
+    if (g_source.owner() != Source::BLUETOOTH) return false;
+    if (!g_source.ready()) return false;         // audio task has not started yet
+    return g_player.write(data, len);
+}
+
+bool btActive() { return g_source.owner() == Source::BLUETOOTH; }
+
+void btSetSampleRate(uint16_t rate) {
+    if (rate >= 8000 && rate <= 48000) g_pendingRate.store(rate);
+}
+
 bool levels(uint8_t bands[NUM_BANDS]) {
     if (g_player.status().state == sp::IDLE) return false;
     const uint32_t age = millis() - g_vizStampMs;
     if (g_vizStampMs == 0 || age > 120) {
-        for (int i = 0; i < NUM_BANDS; ++i) bands[i] = 0;    // buffering / underrun / silence
+        for (int i = 0; i < NUM_BANDS; ++i) bands[i] = 0;
     } else {
         g_analyzer.read(bands);
     }
@@ -549,97 +590,211 @@ bool levels(uint8_t bands[NUM_BANDS]) {
 ````cpp
 #pragma once
 #include <Arduino.h>
+#include "source_manager.h"
 
 namespace audio {
 
 static constexpr int      PIN_BCK  = 27;
 static constexpr int      PIN_LRCK = 25;
 static constexpr int      PIN_DOUT = 26;
-static constexpr uint32_t SAMPLE_RATE_HZ = 44100;   // I2S clock for the built-in tone/scale
+static constexpr uint32_t SAMPLE_RATE_HZ = 44100;
 
-static constexpr int NUM_BANDS = 10;                // OLED bars fed by levels()
+static constexpr int NUM_BANDS = 10;
 
 enum Mode : uint8_t {
-    MODE_OFF    = 0,   // silence
-    MODE_TONE   = 1,   // 440 Hz test tone (built-in generator)
-    MODE_SCALE  = 2,   // C major scale up + down, looping (built-in generator)
-    MODE_STREAM = 3,   // PCM streamed from the laptop (entered/left by the stream functions only)
+    MODE_OFF    = 0,
+    MODE_TONE   = 1,
+    MODE_SCALE  = 2,
+    MODE_STREAM = 3,
 };
 
 enum StreamState : uint8_t {
     STREAM_IDLE      = 0,
-    STREAM_BUFFERING = 1,   // session open, filling the ring before playback
+    STREAM_BUFFERING = 1,
     STREAM_PLAYING   = 2,
-    STREAM_DRAINING  = 3,   // host sent END, playing out what is queued
+    STREAM_DRAINING  = 3,
 };
 
 struct StreamStatus {
-    uint8_t  state;          // StreamState
-    uint16_t session;        // session id of the last HELLO
-    uint16_t underruns;      // ring ran dry while playing (this session)
-    uint32_t fillBytes;      // PCM bytes queued
-    uint32_t capacityBytes;  // ring size
+    uint8_t  state;
+    uint16_t session;
+    uint16_t underruns;
+    uint32_t fillBytes;
+    uint32_t capacityBytes;
 };
 
-// Initialises I2S and starts the audio task (core 0). Returns false on failure.
 bool begin();
-
-// Built-in generators. Ignored while a stream session is active.
-// Thread-safe: the change is applied by the audio task within one DMA period.
 void setMode(Mode m);
 Mode mode();
 uint32_t writeErrors();
 
-// ---- Streaming (called by the UART receiver task) --------------------------
-// Open a session: flushes the ring, reconfigures the I2S clock, starts buffering.
 bool streamBegin(uint32_t rateHz, uint8_t channels, uint16_t session);
-void streamEnd();     // no more data coming: play out the ring, then stop
-void streamAbort();   // stop immediately
-// Queue PCM (whole frames only). All-or-nothing; false if the ring has no room.
+void streamEnd();
+void streamAbort();
 bool streamWrite(const uint8_t* data, uint32_t len);
 StreamStatus streamStatus();
 
-// ---- Visualisation ----------------------------------------------------------
-// Fills bands[] with 0..255 bar heights derived from the PCM actually being played.
-// Returns true while a stream session is active (bands are zero while buffering/silent);
-// returns false when idle so the caller can fall back to its own animation.
+// ---- Bluetooth A2DP sink (mutually exclusive with USB serial) -------------
+bool btBegin();                                      // rate supplied later
+void btEnd();
+bool btWrite(const uint8_t* data, uint32_t len);
+bool btActive();
+void btSetSampleRate(uint16_t rate);                 // called from BT callback
+
+// ---- Visualisation ---------------------------------------------------------
 bool levels(uint8_t bands[NUM_BANDS]);
 
 }  // namespace audio
+````
+
+### mp3/bt_audio.cpp
+
+````cpp
+#include "bt_audio.h"
+#include "audio_out.h"
+
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "BluetoothA2DPSink.h"
+
+namespace bt {
+namespace {
+
+BluetoothA2DPSink* g_sink       = nullptr;
+SemaphoreHandle_t  g_metaMutex = nullptr;
+
+volatile bool g_connected = false;
+volatile bool g_metaDirty = false;
+
+char g_title[96]  = {0};
+char g_artist[64] = {0};
+
+// Called on the Bluetooth task for each decoded SBC frame.
+void dataCallback(const uint8_t* data, uint32_t length) {
+    // Defensive: the library should already deliver frame-aligned data.
+    if (length < 4) return;
+    length -= length % 4;                    // stereo 16-bit = 4 bytes/frame
+    audio::btWrite(data, length);
+}
+
+// Called on the BT task for A2DP connection-state changes.
+void connectionCallback(esp_a2d_connection_state_t state, void* /*ptr*/) {
+    if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+        g_connected = true;
+        audio::btBegin();                    // rate supplied by sample-rate callback
+    } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+        g_connected = false;
+        audio::btEnd();
+        if (g_metaMutex && xSemaphoreTake(g_metaMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            g_title[0]  = 0;
+            g_artist[0] = 0;
+            g_metaDirty = true;
+            xSemaphoreGive(g_metaMutex);
+        }
+    }
+}
+
+// Called on the BT task when AVRCP metadata arrives.
+void metadataCallback(uint8_t id, const uint8_t* text) {
+    if (!g_metaMutex || !text) return;
+    if (xSemaphoreTake(g_metaMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+    if (id == ESP_AVRC_MD_ATTR_TITLE) {          // 0x01
+        strncpy(g_title, (const char*)text, sizeof(g_title) - 1);
+        g_title[sizeof(g_title) - 1] = 0;
+        g_metaDirty = true;
+    } else if (id == ESP_AVRC_MD_ATTR_ARTIST) {   // 0x02
+        strncpy(g_artist, (const char*)text, sizeof(g_artist) - 1);
+        g_artist[sizeof(g_artist) - 1] = 0;
+        g_metaDirty = true;
+    }
+    xSemaphoreGive(g_metaMutex);
+}
+
+// Called on the BT task when the negotiated sample rate changes.
+void sampleRateCallback(uint16_t rate) {
+    audio::btSetSampleRate(rate);
+}
+
+}  // namespace
+
+bool begin() {
+    if (g_sink) return true;
+
+    g_metaMutex = xSemaphoreCreateMutex();
+    if (!g_metaMutex) return false;
+
+    g_sink = new BluetoothA2DPSink();
+    if (!g_sink) { vSemaphoreDelete(g_metaMutex); g_metaMutex = nullptr; return false; }
+
+    // false = do NOT install the library's internal I2S driver.
+    g_sink->set_stream_reader(dataCallback, false);
+    g_sink->set_on_connection_state_changed(connectionCallback);
+    g_sink->set_avrc_metadata_callback(metadataCallback);
+    g_sink->set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE |
+                                             ESP_AVRC_MD_ATTR_ARTIST);
+    g_sink->set_sample_rate_callback(sampleRateCallback);
+    g_sink->start("Mochi");
+    return true;
+}
+
+void end() {
+    if (g_sink) { g_sink->end(); delete g_sink; g_sink = nullptr; }
+    if (g_metaMutex) { vSemaphoreDelete(g_metaMutex); g_metaMutex = nullptr; }
+}
+
+Snapshot poll() {
+    Snapshot s;
+    s.connected       = g_connected;
+    s.metadataChanged = false;
+    s.title[0]        = 0;
+    s.artist[0]       = 0;
+    if (g_metaMutex && xSemaphoreTake(g_metaMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (g_metaDirty) {
+            s.metadataChanged = true;
+            strncpy(s.title,  g_title,  sizeof(s.title)  - 1);
+            strncpy(s.artist, g_artist, sizeof(s.artist) - 1);
+            s.title[sizeof(s.title) - 1]   = 0;
+            s.artist[sizeof(s.artist) - 1] = 0;
+            g_metaDirty = false;
+        }
+        xSemaphoreGive(g_metaMutex);
+    }
+    return s;
+}
+
+}  // namespace bt
+````
+
+### mp3/bt_audio.h
+
+````cpp
+#pragma once
+#include <stdint.h>
+
+namespace bt {
+
+bool begin();
+void end();
+
+struct Snapshot {
+    bool connected;
+    bool metadataChanged;
+    char title[96];
+    char artist[64];
+};
+
+Snapshot poll();
+
+}  // namespace bt
 ````
 
 ### mp3/mp3.ino
 
 ````cpp
 /*
- * Retro 128x64 OLED Audio Visualizer + laptop-streamed MP3 player
- * Milestone 04 - PCM5102A I2S DAC fed by PCM streamed over USB Serial
- *
- * Hardware:
- *   ESP32-WROOM-32 DevKit V1
- *   M130-12864-B-4V 1.3" OLED, SH1106, 0x3C
- *     SDA = GPIO21, SCL = GPIO22, U8g2 full framebuffer, hardware I2C
- *   PCM5102A breakout (3-wire I2S, SCK tied to GND)
- *     BCK = GPIO27, LCK = GPIO25, DIN = GPIO26   (see audio_out.h)
- *
- * Signal path:
- *   laptop: play_mp3.py -> FFmpeg (MP3 -> s16le PCM) -> USB serial, 921600 baud
- *   ESP32 : stream_rx.cpp  (UART task, core 0, framing + CRC + flow control)
- *           stream_player.cpp (lock-free ring buffer + playback state machine)
- *           audio_out.cpp  (audio task, core 0, I2S DMA)  -> PCM5102A
- *
- * Tasks:
- *   audio       core 0, prio 5  owns I2S and all playback state
- *   stream_rx   core 0, prio 4  owns Serial; the only producer into the ring
- *   loopTask    core 1, prio 1  this file: OLED rendering + BOOT button, never touches I2S/Serial RX
- *
- * The OLED bars show the spectrum of the audio actually being played (10 Goertzel
- * bands computed in the audio task). With no stream active, the original synthetic
- * animation runs exactly as in Milestone 02/03.
- *
- * Built-in test generators (no laptop needed, only while no stream is active):
- *   - Serial monitor (921600!): 's' scale, '1' 440 Hz, '0' off, 't' toggle tone, 'e' error count
- *   - BOOT button (GPIO0): cycles OFF -> TONE -> SCALE -> OFF
+ * Retro 128x64 OLED Audio Visualizer + laptop/BT-streamed MP3 player
+ * Milestone 05 â€“ A2DP Sink + Mochi UI
  */
 
 #include <Arduino.h>
@@ -648,6 +803,8 @@ bool levels(uint8_t bands[NUM_BANDS]);
 
 #include "audio_out.h"
 #include "stream_rx.h"
+#include "player_ui.h"
+#include "bt_audio.h"
 
 // -----------------------------------------------------------------------------
 // Verified hardware configuration
@@ -656,63 +813,34 @@ static constexpr uint8_t SDA_PIN  = 21;
 static constexpr uint8_t SCL_PIN  = 22;
 static constexpr uint8_t I2C_ADDR = 0x3C;
 
-// Play the built-in scale at boot? Off by default: opening the COM port from the laptop
-// usually resets the ESP32, so the scale would play at the start of every playback.
 static constexpr bool    PLAY_SCALE_AT_BOOT = false;
-
-// The old 1 Hz sine for the Arduino Serial Plotter. Off: it would write ~30 text lines/s
-// onto the same UART that carries the binary protocol.
 static constexpr bool    SERIAL_PLOTTER_DEMO = false;
 
-static constexpr uint8_t BOOT_BTN_PIN    = 0;     // DevKit BOOT button, active low
+static constexpr uint8_t BOOT_BTN_PIN    = 0;
 static constexpr uint32_t BTN_DEBOUNCE_MS = 30;
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+PlayerUI ui;
 
 // -----------------------------------------------------------------------------
-// Visualizer geometry
+// Synthetic visualizer (used only by built-in test generators)
 // -----------------------------------------------------------------------------
 static constexpr uint8_t NUM_BANDS = 10;
 static_assert(NUM_BANDS == audio::NUM_BANDS, "visualizer and audio analyzer band counts differ");
-
-static constexpr uint8_t BAR_X0    = 6;
-static constexpr uint8_t BAR_PITCH = 12;
-static constexpr uint8_t BAR_W     = 8;
-
-static constexpr uint8_t BASELINE_Y = 59;
-static constexpr uint8_t TOP_Y      = 18;
-static constexpr uint8_t MAX_BAR_H  = 40;
-
-static constexpr uint8_t SEG_H     = 2;
-static constexpr uint8_t SEG_PITCH = 3;
-
-static constexpr uint8_t PEAK_HOLD_FRAMES = 12;
-static constexpr uint8_t PEAK_DECAY       = 3;
 
 static constexpr uint8_t BEAT_PERIOD_FRAMES = 14;
 static constexpr uint8_t BEAT_DECAY         = 18;
 
 static constexpr uint32_t FRAME_INTERVAL_MS = 33;  // 30 FPS target
 
-// -----------------------------------------------------------------------------
-// Fixed-size animation state
-// -----------------------------------------------------------------------------
 static uint16_t phase[NUM_BANDS];
 static uint16_t lfsr[NUM_BANDS];
 static uint8_t  env[NUM_BANDS];
-static uint8_t  peak[NUM_BANDS];
-static uint8_t  hold[NUM_BANDS];
 
 static uint8_t  beatEnv      = 0;
 static uint8_t  beatTimer    = 0;
-static uint8_t  overallLevel = 0;
 static uint32_t lastFrame    = 0;
-static bool     liveViz      = false;   // bars driven by real audio
-static bool     vizBuffering = false;   // stream open but still filling the ring
 
-// -----------------------------------------------------------------------------
-// Integer-only sine table: 0..255, one full cycle across 64 entries
-// -----------------------------------------------------------------------------
 static const uint8_t SINE_TABLE[64] = {
     128, 140, 153, 165, 177, 188, 199, 209,
     218, 226, 234, 240, 245, 250, 253, 255,
@@ -724,8 +852,6 @@ static const uint8_t SINE_TABLE[64] = {
      38,  47,  57,  68,  79,  91, 103, 116
 };
 
-// Per-band oscillator speed and spectral tilt.
-// Low bands are stronger and slightly slower; high bands are weaker and faster.
 static const uint16_t BAND_SPEED[NUM_BANDS] = {
     1800, 2100, 2400, 2700, 3000, 3300, 3600, 3900, 4200, 4500
 };
@@ -736,24 +862,17 @@ static const uint8_t BEAT_GAIN[NUM_BANDS] = {
     100, 88, 72, 58, 44, 32, 24, 18, 13, 10
 };
 
-// -----------------------------------------------------------------------------
-// Forward declarations
-// -----------------------------------------------------------------------------
 static void updateVisualizer();
-static void renderFrame();
 static void pollBootButton(uint32_t now);
 static void announceMode(audio::Mode m);
 static void onConsoleChar(char c);
+static void feedUI();
+static void processBtSnapshot();
 
-// -----------------------------------------------------------------------------
-// Setup
-// Order: stream receiver (configures Serial) -> OLED (unchanged M02 path) -> first frame
-//        -> I2S/audio task.
-// OLED comes before audio so the display is already up if audio init fails.
 // -----------------------------------------------------------------------------
 void setup() {
     stream::setConsoleHandler(onConsoleChar);
-    const bool rxOk = stream::begin();       // Serial.begin(921600) + receiver task
+    const bool rxOk = stream::begin();
 
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
@@ -763,21 +882,17 @@ void setup() {
     u8g2.setI2CAddress(I2C_ADDR << 1);
     u8g2.begin();
     u8g2.setPowerSave(0);
-
-    // Re-apply bus clock after U8g2 initialization.
     Wire.setClock(400000);
 
-    // Deterministic, independent LFSR seeds.
+    ui.begin(&u8g2);
+
     for (uint8_t i = 0; i < NUM_BANDS; ++i) {
         lfsr[i] = (uint16_t)(0xACE1u + (uint16_t)i * 0x1234u);
         if (lfsr[i] == 0) lfsr[i] = 0xBEEFu;
     }
 
-    updateVisualizer();
-    renderFrame();
     lastFrame = millis();
 
-    // --- Audio ---
     if (audio::begin()) {
         Serial.println(F("[audio] I2S OK"));
         if (PLAY_SCALE_AT_BOOT) {
@@ -792,15 +907,22 @@ void setup() {
     Serial.print(stream::BAUD);
     Serial.println(F(" baud. Run play_mp3.py on the laptop."));
     Serial.println(F("[audio] 's'=scale '1'=440Hz '0'=off 't'=toggle, BOOT=cycle modes"));
+    Serial.println(F("[bt] will start in ~0.5s: pair with 'Mochi'"));
 }
 
-// -----------------------------------------------------------------------------
-// Non-blocking frame scheduler (unchanged) + non-blocking BOOT button
-// -----------------------------------------------------------------------------
 void loop() {
     const uint32_t now = millis();
 
     pollBootButton(now);
+
+    static bool btInited = false;
+    if (!btInited && now > 500) {
+        btInited = true;
+        if (bt::begin()) Serial.println(F("[bt] A2DP ready, advertising as 'Mochi'"));
+        else             Serial.println(F("[bt] ERROR: A2DP init failed"));
+    }
+
+    processBtSnapshot();
 
     if ((uint32_t)(now - lastFrame) < FRAME_INTERVAL_MS) {
         return;
@@ -808,25 +930,72 @@ void loop() {
     lastFrame = now;
 
     if (SERIAL_PLOTTER_DEMO) {
-        // Generate a 1 Hz sine wave for the Serial Plotter based on uptime
         float plotterSine = sin(now * 2.0 * PI / 1000.0) * 100.0;
         Serial.println(plotterSine);
     }
 
-    updateVisualizer();
-    renderFrame();
+    const audio::Mode m = audio::mode();
+    if (m == audio::MODE_TONE || m == audio::MODE_SCALE) updateVisualizer();
+
+    feedUI();
+    ui.update();
 }
 
-// -----------------------------------------------------------------------------
-// Built-in generator controls: console characters and BOOT button (debounced, no delay())
-// Both are ignored while a stream session is active.
-// -----------------------------------------------------------------------------
+static void processBtSnapshot() {
+    const bt::Snapshot s = bt::poll();
+    ui.setBluetoothConnected(s.connected);
+    if (s.metadataChanged) {
+        if (s.title[0] || s.artist[0]) ui.setTrackInfo(s.title, s.artist);
+        else                            ui.clearTrackInfo();
+    }
+}
+
+static void feedUI() {
+    static bool usbTitleSet = false;
+
+    uint8_t uiLevels[NUM_BANDS];
+    memset(uiLevels, 0, sizeof(uiLevels));
+
+    const audio::StreamStatus ss = audio::streamStatus();
+    const bool streamActive = (ss.state != audio::STREAM_IDLE);
+    const audio::Mode m = audio::mode();
+    if (!streamActive) usbTitleSet = false;
+    if (streamActive) {
+        uint8_t live[NUM_BANDS];
+        if (audio::levels(live)) {
+            for (int i = 0; i < NUM_BANDS; ++i)
+                uiLevels[i] = (uint8_t)((uint16_t)live[i] * 100u / 255u);
+        }
+        ui.setPlaying(true);
+        if (!bt::poll().connected && !audio::btActive()) {
+            if (!usbTitleSet) {
+                ui.setTrackInfo("USB STREAM", "playing");
+                usbTitleSet = true;
+            }
+        }
+    } else if (m == audio::MODE_TONE || m == audio::MODE_SCALE) {
+        for (int i = 0; i < NUM_BANDS; ++i)
+            uiLevels[i] = (uint8_t)((uint16_t)env[i] * 100u / 255u);
+        ui.setPlaying(true);
+        static audio::Mode lastTestMode = audio::MODE_OFF;
+        if (m != lastTestMode) {
+            ui.setTrackInfo(m == audio::MODE_TONE ? "TEST TONE" : "SCALE",
+                            "built-in generator");
+            lastTestMode = m;
+        }
+    } else {
+        ui.setPlaying(false);
+        if (!bt::poll().connected) ui.clearTrackInfo();
+    }
+    ui.setVisualizerLevels(uiLevels);
+}
+
 static bool streamBusy() {
     return audio::streamStatus().state != audio::STREAM_IDLE;
 }
 
 static void announceMode(audio::Mode m) {
-    if (streamBusy()) return;                 // keep the UART clean during playback
+    if (streamBusy()) return;
     Serial.print(F("[audio] mode: "));
     switch (m) {
         case audio::MODE_OFF:    Serial.println(F("OFF"));      break;
@@ -836,7 +1005,6 @@ static void announceMode(audio::Mode m) {
     }
 }
 
-// Called from the stream_rx task for ASCII bytes that arrive while no session is active.
 static void onConsoleChar(char c) {
     if      (c == 's' || c == 'S') { audio::setMode(audio::MODE_SCALE); announceMode(audio::MODE_SCALE); }
     else if (c == '1')             { audio::setMode(audio::MODE_TONE);  announceMode(audio::MODE_TONE); }
@@ -853,7 +1021,6 @@ static void onConsoleChar(char c) {
 }
 
 static void pollBootButton(uint32_t now) {
-    // BOOT button: OFF -> TONE -> SCALE -> OFF
     static bool     lastRaw   = true;
     static bool     stable    = true;
     static uint32_t changedAt = 0;
@@ -875,58 +1042,24 @@ static void pollBootButton(uint32_t now) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Synthetic signal generation, envelope smoothing, peak hold
-// -----------------------------------------------------------------------------
 static void updateVisualizer() {
-    // Real spectrum while a stream session is active, otherwise the synthetic animation.
-    uint8_t live[NUM_BANDS];
-    liveViz      = audio::levels(live);
-    vizBuffering = liveViz && (audio::streamStatus().state == audio::STREAM_BUFFERING);
-
-    if (!liveViz) {
-        // Slow beat pulse, roughly 1.8 Hz at 25-30 FPS.
-        if (beatTimer > 0) {
-            --beatTimer;
-        } else {
-            beatTimer = BEAT_PERIOD_FRAMES;
-            beatEnv   = 255;
-        }
-        if (beatEnv > BEAT_DECAY) {
-            beatEnv -= BEAT_DECAY;
-        } else {
-            beatEnv = 0;
-        }
-    }
-
-    uint16_t sum = 0;
+    if (beatTimer > 0) { --beatTimer; }
+    else { beatTimer = BEAT_PERIOD_FRAMES; beatEnv = 255; }
+    if (beatEnv > BEAT_DECAY) beatEnv -= BEAT_DECAY;
+    else                      beatEnv = 0;
 
     for (uint8_t i = 0; i < NUM_BANDS; ++i) {
-        uint16_t target;
-
-        if (liveViz) {
-            target = live[i];                      // 0..255 from the PCM being played
-        } else {
-            // Independent phase accumulators.
-            phase[i] = (uint16_t)(phase[i] + BAND_SPEED[i]);
-
-            // 16-bit Galois LFSR -> deterministic per-band noise.
-            const uint16_t lsb = lfsr[i] & 1u;
-            lfsr[i] = (uint16_t)((lfsr[i] >> 1) ^ (lsb ? 0xB400u : 0x0000u));
-
-            const uint8_t s = SINE_TABLE[(phase[i] >> 10) & 63u];
-            const uint8_t n = (uint8_t)(lfsr[i] & 0xFFu);
-
-            // 75% periodic movement, 25% noise.
-            const uint16_t base = ((uint16_t)s * 3u + n) >> 2;
-            target = (base * BAND_GAIN[i]) >> 8;
-            target += ((uint16_t)beatEnv * BEAT_GAIN[i]) >> 8;
-            if (target > 255u) target = 255u;
-        }
-
+        phase[i] = (uint16_t)(phase[i] + BAND_SPEED[i]);
+        const uint16_t lsb = lfsr[i] & 1u;
+        lfsr[i] = (uint16_t)((lfsr[i] >> 1) ^ (lsb ? 0xB400u : 0x0000u));
+        const uint8_t s = SINE_TABLE[(phase[i] >> 10) & 63u];
+        const uint8_t n = (uint8_t)(lfsr[i] & 0xFFu);
+        const uint16_t base = ((uint16_t)s * 3u + n) >> 2;
+        uint16_t target = (base * BAND_GAIN[i]) >> 8;
+        target += ((uint16_t)beatEnv * BEAT_GAIN[i]) >> 8;
+        if (target > 255u) target = 255u;
         const uint8_t t = (uint8_t)target;
 
-        // Fast attack, slow release, integer-only.
         if (t > env[i]) {
             uint8_t step = ((t - env[i]) * 6u) >> 3;
             if (step == 0) step = 1;
@@ -938,100 +1071,486 @@ static void updateVisualizer() {
             env[i] = (uint8_t)(env[i] - step);
             if (env[i] < t) env[i] = t;
         }
+    }
+}
+````
 
-        // Peak hold with controlled decay.
-        if (env[i] >= peak[i]) {
-            peak[i] = env[i];
-            hold[i] = PEAK_HOLD_FRAMES;
+### mp3/player_ui.cpp
+
+````cpp
+#include "player_ui.h"
+#include <string.h>
+#include <math.h>
+
+#define SCREEN_W 128
+#define SCREEN_H 64
+
+#define UI_FONT_TITLE   u8g2_font_6x12_tf
+#define UI_FONT_ARTIST  u8g2_font_5x7_tf
+#define UI_FONT_TINY    u8g2_font_4x6_tf
+
+#define BOOT_MS             1400
+#define ENTRY_WIPE_MS        200
+#define SCROLL_SPEED_PX_S     22.0f
+#define SCROLL_GAP_PX         12
+#define BLINK_INTERVAL_MS   3400
+#define BLINK_DURATION_MS    140
+#define FRAME_MIN_MS          33          // 30 FPS target
+#define TITLE_AVAIL_W        120
+#define ARTIST_AVAIL_W       120
+
+#define VIZ_ATTACK           0.55f
+#define VIZ_RELEASE          0.14f
+#define VIZ_PEAK_FALL_PER_S  60.0f
+
+const uint8_t PlayerUI::mochi_frames_[4][20] = {
+    { 0x1E,0x00, 0x3F,0x00, 0x7F,0x00, 0xE4,0xC0, 0xE4,0xC0,
+      0xFF,0xC0, 0xF3,0xC0, 0x7F,0x00, 0x3F,0x00, 0x1E,0x00 },
+    { 0x1E,0x00, 0x3F,0x00, 0x7F,0x00, 0xFF,0xC0, 0xE4,0xC0,
+      0xFF,0xC0, 0xF3,0xC0, 0x7F,0x00, 0x3F,0x00, 0x1E,0x00 },
+    { 0x1E,0x00, 0x3F,0x00, 0x7F,0x00, 0xE4,0xC0, 0xE4,0xC0,
+      0xFF,0xC0, 0xE1,0xC0, 0x7F,0x00, 0x3F,0x00, 0x1E,0x00 },
+    { 0x1E,0x00, 0x3F,0x00, 0x7F,0x00, 0xE6,0x40, 0xE6,0x40,
+      0xFF,0xC0, 0xF3,0xC0, 0x7F,0x00, 0x3F,0x00, 0x1E,0x00 },
+};
+
+static const uint8_t kBTIcon[7]    = { 0x08,0x18,0x54,0x14,0x54,0x18,0x08 };
+static const uint8_t kPlayIcon[7]  = { 0x20,0x30,0x38,0x3C,0x38,0x30,0x20 };
+static const uint8_t kPauseIcon[7] = { 0x6C,0x6C,0x6C,0x6C,0x6C,0x6C,0x6C };
+
+void PlayerUI::begin(U8G2* display) {
+    u8g2_ = display;
+    screen_ = UIScreen::BOOT;
+    screenEnteredMs_ = millis();
+    nextBlinkMs_ = millis() + 2400;
+    lastRenderMs_ = millis() - FRAME_MIN_MS;
+}
+
+void PlayerUI::enterScreen(UIScreen s) {
+    if (screen_ == s) return;
+    screen_ = s;
+    screenEnteredMs_ = millis();
+    if (s != UIScreen::NOW_PLAYING && s != UIScreen::PAUSED) {
+        titleScroll_  = 0;
+        artistScroll_ = 0;
+    }
+}
+
+UIScreen PlayerUI::computeAutoScreen() const {
+    if (!btConnected_ && !playing_ && !hasTitle_ && !hasArtist_) return UIScreen::IDLE;
+    if (!hasTitle_ && !hasArtist_) return UIScreen::NO_METADATA;
+    return playing_ ? UIScreen::NOW_PLAYING : UIScreen::PAUSED;
+}
+
+void PlayerUI::setTrackInfo(const char* title, const char* artist) {
+    if (title && *title) {
+        strncpy(title_, title, sizeof(title_) - 1);
+        title_[sizeof(title_) - 1] = 0;
+        hasTitle_ = true;
+    } else { title_[0] = 0; hasTitle_ = false; }
+    if (artist && *artist) {
+        strncpy(artist_, artist, sizeof(artist_) - 1);
+        artist_[sizeof(artist_) - 1] = 0;
+        hasArtist_ = true;
+    } else { artist_[0] = 0; hasArtist_ = false; }
+    if (u8g2_) {
+        u8g2_->setFont(UI_FONT_TITLE);
+        titleWidth_  = u8g2_->getUTF8Width(title_);
+        u8g2_->setFont(UI_FONT_ARTIST);
+        artistWidth_ = u8g2_->getUTF8Width(artist_);
+    }
+    titleScroll_ = 0; artistScroll_ = 0;
+}
+
+void PlayerUI::clearTrackInfo() {
+    title_[0] = 0; artist_[0] = 0;
+    hasTitle_ = hasArtist_ = false;
+    titleWidth_ = artistWidth_ = 0;
+    titleScroll_ = artistScroll_ = 0;
+}
+
+void PlayerUI::setPlaying(bool playing) { playing_ = playing; }
+
+void PlayerUI::setBluetoothConnected(bool connected) {
+    bool was = btConnected_;
+    btConnected_ = connected;
+    if (!was && connected && screen_ == UIScreen::PAIRING) {
+        searching_ = false;
+        autoMode_  = true;
+        enterScreen(computeAutoScreen());
+    }
+}
+
+void PlayerUI::setVisualizerLevels(const uint8_t levels[10]) {
+    for (int i = 0; i < 10; ++i)
+        vizTarget_[i] = levels[i] > 100 ? 100 : levels[i];
+}
+
+void PlayerUI::showPairing()  { autoMode_ = false; searching_ = true; enterScreen(UIScreen::PAIRING); }
+void PlayerUI::setScreen(UIScreen s) { autoMode_ = false; enterScreen(s); }
+void PlayerUI::setAutoMode(bool enabled) {
+    autoMode_ = enabled;
+    if (enabled) enterScreen(computeAutoScreen());
+}
+
+void PlayerUI::update() {
+    if (!u8g2_) return;
+    uint32_t now = millis();
+    if (now - lastRenderMs_ < FRAME_MIN_MS) return;
+    uint32_t dt_ms = now - lastRenderMs_;
+    lastRenderMs_ = now;
+    float dt = dt_ms / 1000.0f;
+
+    if (screen_ == UIScreen::BOOT && (now - screenEnteredMs_) >= BOOT_MS)
+        enterScreen(computeAutoScreen());
+
+    if (autoMode_ && screen_ != UIScreen::BOOT) {
+        UIScreen s = computeAutoScreen();
+        if (s != screen_) enterScreen(s);
+    }
+
+    updateScroll(dt);
+    updateVisualizer(dt);
+
+    u8g2_->clearBuffer();
+    render();
+    u8g2_->sendBuffer();
+}
+
+void PlayerUI::updateScroll(float dt) {
+    if (screen_ != UIScreen::NOW_PLAYING && screen_ != UIScreen::NO_METADATA) return;
+    float adv = SCROLL_SPEED_PX_S * dt;
+    if (titleWidth_ > TITLE_AVAIL_W) {
+        titleScroll_ += adv;
+        if (titleScroll_ > (float)(titleWidth_ + SCROLL_GAP_PX)) titleScroll_ = 0.0f;
+    }
+    if (artistWidth_ > ARTIST_AVAIL_W) {
+        artistScroll_ += adv;
+        if (artistScroll_ > (float)(artistWidth_ + SCROLL_GAP_PX)) artistScroll_ = 0.0f;
+    }
+}
+
+void PlayerUI::updateVisualizer(float dt) {
+    bool active = (screen_ == UIScreen::NOW_PLAYING) ||
+                  (screen_ == UIScreen::NO_METADATA);
+    uint32_t now = millis();
+    for (int i = 0; i < 10; ++i) {
+        float target;
+        if (active) {
+            target = (float)vizTarget_[i];
         } else {
-            if (hold[i] > 0) {
-                --hold[i];
-            } else if (peak[i] > 0) {
-                peak[i] = (peak[i] > PEAK_DECAY)
-                            ? (uint8_t)(peak[i] - PEAK_DECAY)
-                            : 0;
-            }
-            if (peak[i] < env[i]) peak[i] = env[i];
+            float t = now * 0.001f;
+            target = 8.0f + 5.0f * sinf(t * 1.2f + i * 0.65f);
+            if (target < 0.0f) target = 0.0f;
         }
+        if (target > vizLevel_[i]) vizLevel_[i] += (target - vizLevel_[i]) * VIZ_ATTACK;
+        else                       vizLevel_[i] += (target - vizLevel_[i]) * VIZ_RELEASE;
 
-        sum += env[i];
+        if (vizLevel_[i] >= vizPeak_[i]) vizPeak_[i] = vizLevel_[i];
+        else {
+            vizPeak_[i] -= VIZ_PEAK_FALL_PER_S * dt;
+            if (vizPeak_[i] < vizLevel_[i]) vizPeak_[i] = vizLevel_[i];
+            if (vizPeak_[i] < 0.0f) vizPeak_[i] = 0.0f;
+        }
     }
-
-    overallLevel = (uint8_t)(sum / NUM_BANDS);
 }
 
-// -----------------------------------------------------------------------------
-// Rendering: full framebuffer, one sendBuffer per frame
-// -----------------------------------------------------------------------------
-static void renderFrame() {
-    u8g2.clearBuffer();
-    u8g2.setDrawColor(1);
-
-    // Header ---------------------------------------------------------------
-    u8g2.setFont(u8g2_font_5x7_tr);
-    u8g2.drawStr(4, 8, "SPECTRUM");
-    u8g2.drawStr(86, 8, liveViz ? (vizBuffering ? "BUFF" : "LIVE") : "SYNTH");
-    u8g2.drawHLine(2, 10, 124);
-
-    // Tiny three-bar level meter.
-    const uint8_t m1 = (uint8_t)(2u + (((uint16_t)overallLevel * 4u) >> 8));
-    const uint8_t m2 = (uint8_t)(2u + (((uint16_t)overallLevel * 3u) >> 8));
-    const uint8_t m3 = (uint8_t)(2u + (((uint16_t)overallLevel * 2u) >> 8));
-    u8g2.drawBox(116, (uint8_t)(9 - m1), 2, m1);
-    u8g2.drawBox(120, (uint8_t)(9 - m2), 2, m2);
-    u8g2.drawBox(124, (uint8_t)(9 - m3), 2, m3);
-
-    // Subtle left-edge scale ticks.
-    u8g2.drawHLine(0, 22, 2);
-    u8g2.drawHLine(0, 32, 2);
-    u8g2.drawHLine(0, 42, 2);
-    u8g2.drawHLine(0, 52, 2);
-
-    // Spectrum bars --------------------------------------------------------
-    for (uint8_t i = 0; i < NUM_BANDS; ++i) {
-        const uint8_t x = (uint8_t)(BAR_X0 + i * BAR_PITCH);
-
-        uint8_t h = (uint8_t)(((uint16_t)env[i] * MAX_BAR_H) >> 8);
-        if (h > MAX_BAR_H) h = MAX_BAR_H;
-
-        const uint8_t segs = h / SEG_PITCH;
-        const uint8_t rem  = h % SEG_PITCH;
-
-        // Full segments, bottom-up.
-        for (uint8_t s = 0; s < segs; ++s) {
-            const uint8_t y = (uint8_t)(BASELINE_Y - (s + 1) * SEG_PITCH + 1);
-            u8g2.drawBox(x, y, BAR_W, SEG_H);
-        }
-
-        // Partial top segment for smoother height.
-        if (rem > 0) {
-            const uint8_t y = (uint8_t)(BASELINE_Y - segs * SEG_PITCH - rem);
-            u8g2.drawBox(x, y, BAR_W, rem);
-        }
-
-        // Floating peak-hold cap.
-        uint8_t ph = (uint8_t)(((uint16_t)peak[i] * MAX_BAR_H) >> 8);
-        if (ph > MAX_BAR_H) ph = MAX_BAR_H;
-
-        // Compare as uint16_t to avoid uint8_t overflow in env[i] + 6.
-        if (ph > 2 && (uint16_t)peak[i] > (uint16_t)env[i] + 6u) {
-            int16_t py = (int16_t)BASELINE_Y - (int16_t)ph - 2;
-            if (py < TOP_Y) py = TOP_Y;
-            if (py <= (int16_t)(BASELINE_Y - 2)) {
-                u8g2.drawBox(x, (uint8_t)py, BAR_W, 2);
-            }
-        }
-    }
-
-    // Baseline and bottom tick marks.
-    u8g2.drawHLine(2, 60, 124);
-    for (uint8_t i = 0; i < NUM_BANDS; ++i) {
-        const uint8_t cx = (uint8_t)(BAR_X0 + i * BAR_PITCH + (BAR_W / 2));
-        u8g2.drawVLine(cx, 61, 2);
-    }
-
-    u8g2.sendBuffer();
+uint8_t PlayerUI::pickMochiFrame(uint32_t now) const {
+    return ((now % BLINK_INTERVAL_MS) < BLINK_DURATION_MS) ? 1 : 0;
 }
+
+void PlayerUI::drawStatusBar(bool paused) {
+    if (hasTitle_ || hasArtist_) drawPlayPauseIcon(2, 2, !paused);
+    if (btConnected_)            drawBluetoothIcon(SCREEN_W - 9, 2, millis());
+}
+
+void PlayerUI::drawPlayPauseIcon(int x, int y, bool playing) {
+    u8g2_->drawXBMP(x, y, 7, 7, playing ? kPlayIcon : kPauseIcon);
+}
+
+void PlayerUI::drawBluetoothIcon(int x, int y, uint32_t now) {
+    if (searching_) {
+        if (((now / 400) & 1) == 0) u8g2_->drawXBMP(x, y, 7, 7, kBTIcon);
+    } else {
+        u8g2_->drawXBMP(x, y, 7, 7, kBTIcon);
+    }
+}
+
+void PlayerUI::drawMochi(int x, int y, uint8_t frame) {
+    if (frame > 3) frame = 0;
+    u8g2_->drawXBMP(x, y, 10, 10, mochi_frames_[frame]);
+}
+
+void PlayerUI::drawMarquee(int x, int baseline, int availW,
+                           const char* text, int16_t w, float scroll,
+                           const uint8_t* font) {
+    if (!text || !*text) return;
+    u8g2_->setClipWindow(x, baseline - 11, x + availW - 1, baseline + 2);
+    u8g2_->setFont((const uint8_t*)font);
+    if (w <= availW) {
+        int cx = x + (availW - w) / 2;
+        u8g2_->drawUTF8(cx, baseline, text);
+    } else {
+        int dx = x - (int)scroll;
+        u8g2_->drawUTF8(dx, baseline, text);
+        u8g2_->drawUTF8(dx + w + SCROLL_GAP_PX, baseline, text);
+    }
+    u8g2_->setMaxClipWindow();
+}
+
+void PlayerUI::drawVisualizer(int baseY, int maxH, bool active, uint32_t now) {
+    (void)now; (void)active;
+    const int barW = 10, gap = 2;
+    const int totalW = 10 * barW + 9 * gap;
+    const int startX = (SCREEN_W - totalW) / 2;
+    for (int i = 0; i < 10; ++i) {
+        int h     = (int)(vizLevel_[i] * maxH / 100.0f);
+        int peakH = (int)(vizPeak_[i]  * maxH / 100.0f);
+        int x     = startX + i * (barW + gap);
+        if (h > 0) u8g2_->drawBox(x, baseY + maxH - h, barW, h);
+        if (peakH > h + 1) u8g2_->drawHLine(x, baseY + maxH - peakH, barW);
+    }
+}
+
+void PlayerUI::drawEntryWipe() {
+    uint32_t elapsed = millis() - screenEnteredMs_;
+    if (elapsed >= ENTRY_WIPE_MS) return;
+    uint8_t revealH = (uint8_t)((float)elapsed / ENTRY_WIPE_MS * SCREEN_H);
+    if (revealH >= SCREEN_H) return;
+    u8g2_->setDrawColor(0);
+    u8g2_->drawBox(0, 0, SCREEN_W, SCREEN_H - revealH);
+    u8g2_->setDrawColor(1);
+}
+
+void PlayerUI::render() {
+    u8g2_->setDrawColor(1);
+    u8g2_->setFontPosBaseline();
+    switch (screen_) {
+        case UIScreen::BOOT:        renderBoot();             break;
+        case UIScreen::PAIRING:     renderPairing();          break;
+        case UIScreen::NOW_PLAYING: renderNowPlaying(false);  break;
+        case UIScreen::PAUSED:      renderNowPlaying(true);   break;
+        case UIScreen::NO_METADATA: renderNoMetadata(false);  break;
+        case UIScreen::IDLE:        renderIdle();             break;
+    }
+    if (screen_ != UIScreen::BOOT) drawEntryWipe();
+}
+
+void PlayerUI::renderBoot() {
+    uint32_t t = millis() - screenEnteredMs_;
+    uint8_t frame = (t < 400) ? 1 : 0;
+    if (t > 900 && t < 1040) frame = 1;
+    drawMochi((SCREEN_W - 10) / 2, 20, frame);
+
+    const char* word = "M O C H I";
+    u8g2_->setFont(UI_FONT_TINY);
+    int16_t ww = u8g2_->getUTF8Width(word);
+    int cx = (SCREEN_W - ww) / 2;
+    int baseline = 46;
+    if (t >= 500) {
+        float p = (t - 500) / 400.0f;
+        if (p > 1.0f) p = 1.0f;
+        float ease = 1.0f - powf(1.0f - p, 3.0f);
+        int offset = -(int)((1.0f - ease) * 8.0f);
+        u8g2_->drawUTF8(cx, baseline + offset, word);
+    }
+}
+
+void PlayerUI::renderPairing() {
+    uint32_t now = millis();
+    if (((now / 400) & 1) == 0)
+        u8g2_->drawXBMP((SCREEN_W - 7) / 2, 4, 7, 7, kBTIcon);
+
+    uint8_t mf = ((now / 900) & 1) ? 3 : 2;
+    drawMochi((SCREEN_W - 10) / 2, 18, mf);
+
+    u8g2_->setFont(UI_FONT_ARTIST);
+    const char* l1 = btConnected_ ? "CONNECTED" : "PAIRING...";
+    int16_t w1 = u8g2_->getUTF8Width(l1);
+    u8g2_->drawUTF8((SCREEN_W - w1) / 2, 40, l1);
+
+    u8g2_->setFont(UI_FONT_TINY);
+    const char* l2 = btConnected_ ? "ready" : "on your phone";
+    int16_t w2 = u8g2_->getUTF8Width(l2);
+    u8g2_->drawUTF8((SCREEN_W - w2) / 2, 52, l2);
+}
+
+void PlayerUI::renderNowPlaying(bool paused) {
+    drawStatusBar(paused);
+    drawMarquee(4, 24, TITLE_AVAIL_W, title_, titleWidth_,
+                titleScroll_, (const uint8_t*)UI_FONT_TITLE);
+    drawMarquee(4, 35, ARTIST_AVAIL_W, artist_, artistWidth_,
+                artistScroll_, (const uint8_t*)UI_FONT_ARTIST);
+    drawVisualizer(40, 24, !paused, millis());
+}
+
+void PlayerUI::renderNoMetadata(bool paused) {
+    drawStatusBar(paused);
+    uint32_t now = millis();
+    bool vis = ((now / 600) & 1) == 0;
+    u8g2_->setFont(UI_FONT_TITLE);
+    const char* dash = vis ? "\xE2\x80\x94 \xE2\x80\x94 \xE2\x80\x94"
+                           : "\xC2\xB7 \xC2\xB7 \xC2\xB7";
+    int16_t w = u8g2_->getUTF8Width(dash);
+    u8g2_->drawUTF8((SCREEN_W - w) / 2, 24, dash);
+
+    u8g2_->setFont(UI_FONT_ARTIST);
+    const char* unk = "Unknown Artist";
+    int16_t wu = u8g2_->getUTF8Width(unk);
+    u8g2_->drawUTF8((SCREEN_W - wu) / 2, 35, unk);
+    drawVisualizer(40, 24, true, now);
+}
+
+void PlayerUI::renderIdle() {
+    uint32_t now = millis();
+    float bob = sinf(now * 0.0015f * 1.5f);
+    int my = 18 + (bob > 0 ? 1 : 0);
+    drawMochi((SCREEN_W - 10) / 2, my, pickMochiFrame(now));
+
+    uint32_t zt = now % 2100;
+    for (int k = 0; k < 3; ++k) {
+        uint32_t zone = (zt + k * 700) % 2100;
+        if (zone < 900) {
+            int zx = (SCREEN_W - 10) / 2 + 8 + (int)(zone * 0.008f);
+            int zy = my + 6 - (int)(zone * 0.012f);
+            u8g2_->setFont(UI_FONT_TINY);
+            u8g2_->drawStr(zx, zy, "z");
+        }
+    }
+
+    u8g2_->setFont(UI_FONT_ARTIST);
+    const char* wm = "MOCHI";
+    int16_t ww = u8g2_->getUTF8Width(wm);
+    u8g2_->drawUTF8((SCREEN_W - ww) / 2, 44, wm);
+
+    u8g2_->setFont(UI_FONT_TINY);
+    const char* hint = "connect phone";
+    int16_t wh = u8g2_->getUTF8Width(hint);
+    u8g2_->drawUTF8((SCREEN_W - wh) / 2, 58, hint);
+}
+````
+
+### mp3/player_ui.h
+
+````cpp
+#ifndef PLAYER_UI_H
+#define PLAYER_UI_H
+
+#include <Arduino.h>
+#include <U8g2lib.h>
+
+enum class UIScreen : uint8_t {
+    BOOT = 0,
+    PAIRING,
+    NOW_PLAYING,
+    PAUSED,
+    NO_METADATA,
+    IDLE
+};
+
+class PlayerUI {
+public:
+    void begin(U8G2* display);
+    void update();
+
+    void setTrackInfo(const char* title, const char* artist);
+    void clearTrackInfo();
+    void setPlaying(bool playing);
+    void setBluetoothConnected(bool connected);
+    void setVisualizerLevels(const uint8_t levels[10]);
+
+    void showPairing();
+    void setScreen(UIScreen s);
+    void setAutoMode(bool enabled);
+    UIScreen currentScreen() const { return screen_; }
+
+private:
+    U8G2* u8g2_ = nullptr;
+
+    UIScreen screen_ = UIScreen::BOOT;
+    bool autoMode_   = true;
+    bool searching_  = false;
+
+    uint32_t screenEnteredMs_ = 0;
+    uint32_t lastRenderMs_    = 0;
+    uint32_t nextBlinkMs_     = 0;
+
+    char title_[96]  = {0};
+    char artist_[64] = {0};
+    bool hasTitle_   = false, hasArtist_ = false;
+    bool playing_    = false;
+    bool btConnected_ = false;
+
+    int16_t titleWidth_ = 0, artistWidth_ = 0;
+    float   titleScroll_ = 0.0f, artistScroll_ = 0.0f;
+
+    uint8_t vizTarget_[10] = {0};
+    float   vizLevel_[10]  = {0.0f};
+    float   vizPeak_[10]   = {0.0f};
+
+    void enterScreen(UIScreen s);
+    UIScreen computeAutoScreen() const;
+    void updateVisualizer(float dt);
+    void updateScroll(float dt);
+    void render();
+    void renderBoot();
+    void renderPairing();
+    void renderNowPlaying(bool paused);
+    void renderNoMetadata(bool paused);
+    void renderIdle();
+    void drawStatusBar(bool paused);
+    void drawMochi(int x, int y, uint8_t frame);
+    void drawBluetoothIcon(int x, int y, uint32_t now);
+    void drawPlayPauseIcon(int x, int y, bool playing);
+    void drawVisualizer(int baseY, int maxH, bool active, uint32_t now);
+    void drawMarquee(int x, int baseline, int availW,
+                     const char* text, int16_t w, float scroll,
+                     const uint8_t* font);
+    uint8_t pickMochiFrame(uint32_t now) const;
+    void drawEntryWipe();
+
+    static const uint8_t mochi_frames_[4][20];
+};
+
+#endif
+````
+
+### mp3/source_manager.h
+
+````cpp
+#pragma once
+// Explicit audio-source ownership for the single-producer / single-consumer
+// StreamPlayer.  Pure C++11, no Arduino/FreeRTOS dependencies -> testable on PC.
+
+#include <atomic>
+#include <stdint.h>
+
+namespace audio {
+
+enum class Source : uint32_t { NONE = 0, SERIAL = 1, BLUETOOTH = 2 };
+
+class SourceManager {
+ public:
+  bool acquire(Source src) {
+    Source expected = Source::NONE;
+    return owner_.compare_exchange_strong(expected, src,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire);
+  }
+  void setReady(bool r) { ready_.store(r, std::memory_order_release); }
+  void release() {
+    ready_.store(false, std::memory_order_release);
+    owner_.store(Source::NONE, std::memory_order_release);
+  }
+  Source owner() const { return owner_.load(std::memory_order_acquire); }
+  bool   ready() const { return ready_.load(std::memory_order_acquire); }
+
+ private:
+  std::atomic<Source> owner_{Source::NONE};
+  std::atomic<bool>   ready_{false};
+};
+
+}  // namespace audio
 ````
 
 ### mp3/stream_player.cpp
@@ -1590,9 +2109,17 @@ void onHello(const proto::FrameParser::Frame& f) {
 }
 
 void onData(const proto::FrameParser::Frame& f) {
-    if (audio::streamStatus().state == audio::STREAM_IDLE) return;     // no session: ignore stray data
-    if (f.len == 0 || (f.len % g_frameBytes) != 0) { bumpError(proto::ERR_BAD_DATA); return; }
-    if (!audio::streamWrite(f.payload, f.len))      { bumpError(proto::ERR_OVERFLOW); }
+    if (audio::streamStatus().state == audio::STREAM_IDLE) return; // no session: ignore stray data
+    if (audio::btActive()) return; // BT owns the pipeline
+
+    if (f.len == 0 || (f.len % g_frameBytes) != 0) {
+        bumpError(proto::ERR_BAD_DATA);
+        return;
+    }
+
+    if (!audio::streamWrite(f.payload, f.len)) {
+        bumpError(proto::ERR_OVERFLOW);
+    }
 }
 
 void onFrame(const proto::FrameParser::Frame& f) {
@@ -2635,6 +3162,55 @@ int main(int argc, char** argv) {
     }
     printf("blocks=%lu\nmean: ", blocks); for (int j=0;j<10;++j) printf("%5.0f ", sum[j]/blocks);
     printf("\nmax : "); for (int j=0;j<10;++j) printf("%5d ", mx[j]); printf("\n");
+}
+````
+
+### tests/test_ownership.cpp
+
+````cpp
+#include "source_manager.h"
+#include <cassert>
+#include <cstdio>
+
+using namespace audio;
+
+int main() {
+    SourceManager m;
+    assert(m.owner() == Source::NONE);
+    assert(!m.ready());
+
+    // Successful acquisition.
+    assert(m.acquire(Source::SERIAL));
+    assert(m.owner() == Source::SERIAL);
+    assert(!m.ready());
+
+    // Second acquisition must fail.
+    assert(!m.acquire(Source::BLUETOOTH));
+    assert(m.owner() == Source::SERIAL);
+
+    // Ready after audio task start.
+    m.setReady(true);
+    assert(m.ready());
+
+    // Release only from audio task path.
+    m.release();
+    assert(m.owner() == Source::NONE);
+    assert(!m.ready());
+
+    // BT acquisition after release.
+    assert(m.acquire(Source::BLUETOOTH));
+    assert(m.owner() == Source::BLUETOOTH);
+
+    // Serial cannot steal ownership.
+    assert(!m.acquire(Source::SERIAL));
+    assert(m.owner() == Source::BLUETOOTH);
+
+    // Failed startup: release immediately.
+    m.release();
+    assert(m.acquire(Source::SERIAL));
+
+    printf("test_ownership: PASS\n");
+    return 0;
 }
 ````
 
