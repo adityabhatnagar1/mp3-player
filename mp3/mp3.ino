@@ -1,6 +1,6 @@
 /*
  * Retro 128x64 OLED Audio Visualizer + laptop/BT-streamed MP3 player
- * Milestone 05 – A2DP Sink + Mochi UI
+ * Milestone 05 - A2DP Sink + Mochi UI
  */
 
 #include <Arduino.h>
@@ -11,7 +11,11 @@
 #include "stream_rx.h"
 #include "player_ui.h"
 #include "bt_audio.h"
+#include "step_counter.h"
 
+static constexpr uint8_t STEP_BTN_PIN = 5; // New button pin
+static StepCounter stepCounter;
+static constexpr uint32_t STEP_BTN_DEBOUNCE_MS = 25;
 // -----------------------------------------------------------------------------
 // Verified hardware configuration
 // -----------------------------------------------------------------------------
@@ -114,8 +118,21 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(ENC_PIN_A), encoderIsr, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_PIN_B), encoderIsr, CHANGE);
 
+    pinMode(STEP_BTN_PIN, INPUT_PULLUP);
+
+
+    // I2C must be running before we talk to the MPU6050 (and the OLED)
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+
+    // MPU6050 presence check
+    Wire.beginTransmission(0x68);
+    Serial.print(F("[mpu] 0x68 -> "));
+    Serial.println(Wire.endTransmission() == 0 ? F("OK") : F("MISSING"));
+
+    stepCounter.begin(); // Wake up sensor
+    delay(500);          // let sensor settle
+    stepCounter.calibrate();
 
     u8g2.setI2CAddress(I2C_ADDR << 1);
     u8g2.begin();
@@ -153,6 +170,33 @@ void loop() {
 
     pollBootButton(now);
     pollEncoder(now);
+
+    // Poll the sensor as fast as possible for accurate step detection
+    stepCounter.update();
+
+    // Handle the step overlay button (active-low, debounced)
+    {
+        static bool     stepBtnRaw      = true;   // true = not pressed
+        static bool     stepBtnStable   = true;
+        static uint32_t stepBtnChangeAt = 0;
+
+        const bool rawStep = digitalRead(STEP_BTN_PIN) != LOW;
+        if (rawStep != stepBtnRaw) {
+            stepBtnRaw      = rawStep;
+            stepBtnChangeAt = now;
+        } else if (rawStep != stepBtnStable &&
+                   (uint32_t)(now - stepBtnChangeAt) >= STEP_BTN_DEBOUNCE_MS) {
+            stepBtnStable = rawStep;
+            if (!stepBtnStable) {                 // just pressed
+                Serial.print(F("[step] overlay ON, steps="));
+                Serial.println(stepCounter.steps());
+                ui.setStepCount(stepCounter.steps());
+                ui.showStepOverlay(true);
+            } else {                              // just released
+                ui.showStepOverlay(false);
+            }
+        }
+    }
 
     static bool btInited = false;
     if (!btInited && now > 500) {

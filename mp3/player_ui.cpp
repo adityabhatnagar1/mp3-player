@@ -661,6 +661,36 @@ void PlayerUI::renderIdle() {
 void PlayerUI::setVolumeLevel(uint8_t vol) { lastVol_ = vol; }
 void PlayerUI::showVolumeOverlay(uint8_t vol) { lastVol_ = vol; overlayVolMs_ = millis(); }
 void PlayerUI::triggerPlayPause(bool playing) { overlayPlaying_ = playing; overlayPlayPauseMs_ = millis(); }
+void PlayerUI::showStepOverlay(bool show) {
+    showStepOverlay_ = show;
+}
+
+void PlayerUI::setStepCount(uint32_t steps) {
+    stepCount_ = steps;
+}
+
+void PlayerUI::drawStepOverlay() {
+    if (!showStepOverlay_ || !u8g2_) return;
+
+    // Solid white rounded card so it's readable over anything
+    u8g2_->setDrawColor(1);
+    u8g2_->drawRBox(10, 15, 108, 34, 5);
+
+    // Black text on the white card
+    u8g2_->setDrawColor(0);
+
+    u8g2_->setFont(UI_FONT_TINY);
+    u8g2_->drawStr(18, 27, "STEPS TODAY");
+
+    u8g2_->setFont(UI_FONT_LOGO);
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu", static_cast<unsigned long>(stepCount_));
+    int w = u8g2_->getStrWidth(buf);
+    u8g2_->drawStr(64 - w / 2, 45, buf);
+
+    // Restore draw color for anything drawn after us
+    u8g2_->setDrawColor(1);
+}
 
 void PlayerUI::drawOverlays() {
     if (screen_ == UIScreen::BOOT) return;
@@ -732,6 +762,14 @@ void PlayerUI::drawOverlays() {
         u8g2_->drawRFrame(0, y, SCREEN_W, H + 8, 7);
 
         u8g2_->drawBitmap(8, y + 6, 1, 7, kStar);
+        // tiny credit, bottom centre (knocks out the waves behind it)
+        const char* credit = "Made with <3 by AB";
+        int cw = u8g2_->getStrWidth(credit);
+        int cx = (SCREEN_W - cw) / 2;
+        u8g2_->setDrawColor(0);
+        u8g2_->drawBox(cx - 2, 57, cw + 4, 7);
+        u8g2_->setDrawColor(1);
+        u8g2_->drawStr(cx, 63, credit);
 
         const int maxBars = 14;
         const float fb = dispVol_ * maxBars / 100.0f;
@@ -761,5 +799,8 @@ void PlayerUI::drawOverlays() {
         num[3] = 0;
         u8g2_->setFont(UI_FONT_TINY);
         u8g2_->drawStr(107, y + 14, num);
-    }
+    }   // end of volume overlay
+
+    // 3. Step counter overlay: always evaluated, independent of the volume HUD
+    drawStepOverlay();
 }

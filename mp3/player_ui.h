@@ -32,6 +32,8 @@ public:
     void setAutoMode(bool enabled);
     UIScreen currentScreen() const { return screen_; }
     bool bootFinished() const { return screen_ != UIScreen::BOOT; }
+    void showStepOverlay(bool show);
+    void setStepCount(uint32_t steps);
 
 private:
     uint32_t overlayVolMs_ = 0;
@@ -88,6 +90,10 @@ private:
                      const uint8_t* font);
     uint8_t pickFace(uint32_t now) const;
     void drawEntryWipe();
+
+    bool     showStepOverlay_ = false;
+    uint32_t stepCount_ = 0;    
+    void drawStepOverlay();
 
     static const uint8_t mascot_[8][72];   // 24x24, 3 bytes/row
 };
