@@ -25,6 +25,30 @@ static constexpr bool    SERIAL_PLOTTER_DEMO = false;
 static constexpr uint8_t BOOT_BTN_PIN    = 0;
 static constexpr uint32_t BTN_DEBOUNCE_MS = 30;
 
+// ---- Rotary encoder (EC11) ----
+static constexpr uint8_t  ENC_PIN_A  = 32;
+static constexpr uint8_t  ENC_PIN_B  = 33;
+static constexpr uint8_t  ENC_PIN_SW = 4;
+static constexpr uint32_t ENC_SW_DEBOUNCE_MS = 25;
+static constexpr int32_t  ENC_STEPS_PER_DETENT = 4;   // try 2 if too coarse
+static constexpr int      ENC_VOL_STEP = 2;
+
+static volatile int32_t encDelta     = 0;
+static volatile uint8_t encLastState = 0;
+
+DRAM_ATTR static const int8_t ENC_TBL[16] = {
+     0, +1, -1,  0,
+    -1,  0,  0, +1,
+    +1,  0,  0, -1,
+     0, -1, +1,  0
+};
+
+static void IRAM_ATTR encoderIsr() {
+    const uint8_t cur = (uint8_t)((digitalRead(ENC_PIN_A) << 1) | digitalRead(ENC_PIN_B));
+    encDelta += ENC_TBL[(encLastState << 2) | cur];
+    encLastState = cur;
+}
+
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 PlayerUI ui;
 
@@ -70,6 +94,7 @@ static const uint8_t BEAT_GAIN[NUM_BANDS] = {
 
 static void updateVisualizer();
 static void pollBootButton(uint32_t now);
+static void pollEncoder(uint32_t now);
 static void announceMode(audio::Mode m);
 static void onConsoleChar(char c);
 static void feedUI();
@@ -81,6 +106,13 @@ void setup() {
     const bool rxOk = stream::begin();
 
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
+    pinMode(ENC_PIN_A,  INPUT_PULLUP);
+    pinMode(ENC_PIN_B,  INPUT_PULLUP);
+    pinMode(ENC_PIN_SW, INPUT_PULLUP);
+    encLastState = (uint8_t)((digitalRead(ENC_PIN_A) << 1) | digitalRead(ENC_PIN_B));
+    attachInterrupt(digitalPinToInterrupt(ENC_PIN_A), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_PIN_B), encoderIsr, CHANGE);
 
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
@@ -120,6 +152,7 @@ void loop() {
     const uint32_t now = millis();
 
     pollBootButton(now);
+    pollEncoder(now);
 
     static bool btInited = false;
     if (!btInited && now > 500) {
@@ -172,7 +205,7 @@ static void feedUI() {
             for (int i = 0; i < NUM_BANDS; ++i)
                 uiLevels[i] = (uint8_t)((uint16_t)live[i] * 100u / 255u);
         }
-        ui.setPlaying(true);
+        ui.setPlaying(!(audio::btActive() && bt::isPaused()));
         if (!bt::poll().connected && !audio::btActive()) {
             if (!usbTitleSet) {
                 ui.setTrackInfo("USB STREAM", "playing");
@@ -276,6 +309,45 @@ static void updateVisualizer() {
             if (step == 0) step = 1;
             env[i] = (uint8_t)(env[i] - step);
             if (env[i] < t) env[i] = t;
+        }
+    }
+}
+
+static void pollEncoder(uint32_t now) {
+    noInterrupts();
+    const int32_t d = encDelta;
+    encDelta = 0;
+    interrupts();
+
+    if (d != 0) {
+        static int32_t accum = 0;
+        accum += d;
+        while (accum >= ENC_STEPS_PER_DETENT) {
+            accum -= ENC_STEPS_PER_DETENT;
+            int v = audio::volume() + ENC_VOL_STEP;
+            if (v > 100) v = 100;
+            audio::setVolume((uint8_t)v);
+        }
+        while (accum <= -ENC_STEPS_PER_DETENT) {
+            accum += ENC_STEPS_PER_DETENT;
+            int v = audio::volume() - ENC_VOL_STEP;
+            if (v < 0) v = 0;
+            audio::setVolume((uint8_t)v);
+        }
+    }
+
+    static bool     lastRaw   = true;
+    static bool     stable    = true;
+    static uint32_t changedAt = 0;
+    const bool raw = digitalRead(ENC_PIN_SW) != LOW;
+    if (raw != lastRaw) {
+        lastRaw   = raw;
+        changedAt = now;
+    } else if (raw != stable && (uint32_t)(now - changedAt) >= ENC_SW_DEBOUNCE_MS) {
+        stable = raw;
+        if (!stable && audio::btActive()) {      // press, Bluetooth only
+            if (bt::isPaused()) bt::resume();
+            else                bt::pause();
         }
     }
 }

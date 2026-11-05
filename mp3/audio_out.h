@@ -51,6 +51,9 @@ bool btWrite(const uint8_t* data, uint32_t len);
 bool btActive();
 void btSetSampleRate(uint16_t rate);                 // called from BT callback
 
+void    setVolume(uint8_t vol);   // 0..100
+uint8_t volume();
+
 // ---- Visualisation ---------------------------------------------------------
 bool levels(uint8_t bands[NUM_BANDS]);
 

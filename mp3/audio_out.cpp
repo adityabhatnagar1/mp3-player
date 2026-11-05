@@ -90,6 +90,7 @@ constexpr uint16_t BT_SESSION = 0x0000;   // reserved
 
 // --- pending sample-rate from BT -------------------------------------------
 std::atomic<uint32_t> g_pendingRate{0};
+volatile uint8_t g_volume = 70;
 
 int16_t g_chunk[CHUNK_FRAMES * 2];
 
@@ -275,6 +276,13 @@ void audioTask(void*) {
             }
         }
 
+        const uint8_t vol = g_volume;
+        if (vol < 100) {
+            const int32_t gain = (int32_t)vol * 32768 / 100;
+            for (int i = 0; i < CHUNK_FRAMES * 2; ++i)
+                g_chunk[i] = (int16_t)(((int32_t)g_chunk[i] * gain) >> 15);
+        }
+
         size_t written = 0;
         const esp_err_t err = i2s_write(I2S_PORT, g_chunk, sizeof(g_chunk),
                                         &written, portMAX_DELAY);
@@ -337,6 +345,8 @@ void setMode(Mode m) {
 }
 Mode mode()            { return g_mode; }
 uint32_t writeErrors() { return g_writeErrors; }
+void    setVolume(uint8_t v) { if (v > 100) v = 100; g_volume = v; }
+uint8_t volume()             { return g_volume; }
 
 bool streamBegin(uint32_t rateHz, uint8_t channels, uint16_t session) {
     if (!g_source.acquire(Source::USB_SERIAL)) return false;

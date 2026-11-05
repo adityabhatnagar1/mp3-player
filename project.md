@@ -2,6 +2,7 @@
 
 ````text
 .
+├── ESP32-A2DP-main.zip
 ├── mp3
 │   ├── audio_levels.cpp
 │   ├── audio_levels.h
@@ -43,6 +44,10 @@
     ├── test_ownership.cpp
     └── test_proto.cpp
 ````
+
+### ESP32-A2DP-main.zip
+
+_(binary file, content omitted)_
 
 ### mp3/audio_levels.cpp
 
@@ -255,6 +260,7 @@ constexpr uint16_t BT_SESSION = 0x0000;   // reserved
 
 // --- pending sample-rate from BT -------------------------------------------
 std::atomic<uint32_t> g_pendingRate{0};
+volatile uint8_t g_volume = 70;
 
 int16_t g_chunk[CHUNK_FRAMES * 2];
 
@@ -440,6 +446,13 @@ void audioTask(void*) {
             }
         }
 
+        const uint8_t vol = g_volume;
+        if (vol < 100) {
+            const int32_t gain = (int32_t)vol * 32768 / 100;
+            for (int i = 0; i < CHUNK_FRAMES * 2; ++i)
+                g_chunk[i] = (int16_t)(((int32_t)g_chunk[i] * gain) >> 15);
+        }
+
         size_t written = 0;
         const esp_err_t err = i2s_write(I2S_PORT, g_chunk, sizeof(g_chunk),
                                         &written, portMAX_DELAY);
@@ -502,9 +515,11 @@ void setMode(Mode m) {
 }
 Mode mode()            { return g_mode; }
 uint32_t writeErrors() { return g_writeErrors; }
+void    setVolume(uint8_t v) { if (v > 100) v = 100; g_volume = v; }
+uint8_t volume()             { return g_volume; }
 
 bool streamBegin(uint32_t rateHz, uint8_t channels, uint16_t session) {
-    if (!g_source.acquire(Source::SERIAL)) return false;
+    if (!g_source.acquire(Source::USB_SERIAL)) return false;
     if (!streamBeginInternal(rateHz, channels, session)) {
         g_source.release();
         return false;
@@ -513,17 +528,17 @@ bool streamBegin(uint32_t rateHz, uint8_t channels, uint16_t session) {
 }
 
 void streamEnd() {
-    if (g_source.owner() != Source::SERIAL) return;
+    if (g_source.owner() != Source::USB_SERIAL) return;
     Cmd c = {}; c.type = CMD_STREAM_END; post(c);
 }
 
 void streamAbort() {
-    if (g_source.owner() != Source::SERIAL) return;
+    if (g_source.owner() != Source::USB_SERIAL) return;
     Cmd c = {}; c.type = CMD_STREAM_ABORT; post(c);
 }
 
 bool streamWrite(const uint8_t* data, uint32_t len) {
-    if (g_source.owner() != Source::SERIAL) return false;
+    if (g_source.owner() != Source::USB_SERIAL) return false;
     return g_player.write(data, len);
 }
 
@@ -641,6 +656,9 @@ bool btWrite(const uint8_t* data, uint32_t len);
 bool btActive();
 void btSetSampleRate(uint16_t rate);                 // called from BT callback
 
+void    setVolume(uint8_t vol);   // 0..100
+uint8_t volume();
+
 // ---- Visualisation ---------------------------------------------------------
 bool levels(uint8_t bands[NUM_BANDS]);
 
@@ -665,6 +683,7 @@ BluetoothA2DPSink* g_sink       = nullptr;
 SemaphoreHandle_t  g_metaMutex = nullptr;
 
 volatile bool g_connected = false;
+volatile bool g_paused = false;
 volatile bool g_metaDirty = false;
 
 char g_title[96]  = {0};
@@ -682,9 +701,11 @@ void dataCallback(const uint8_t* data, uint32_t length) {
 void connectionCallback(esp_a2d_connection_state_t state, void* /*ptr*/) {
     if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         g_connected = true;
+        g_paused = false;
         audio::btBegin();                    // rate supplied by sample-rate callback
     } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
         g_connected = false;
+        g_paused = false;
         audio::btEnd();
         if (g_metaMutex && xSemaphoreTake(g_metaMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             g_title[0]  = 0;
@@ -763,6 +784,10 @@ Snapshot poll() {
     return s;
 }
 
+bool isPaused() { return g_paused; }
+void pause()    { if (g_sink) { g_sink->pause(); g_paused = true;  } }
+void resume()   { if (g_sink) { g_sink->play();  g_paused = false; } }
+
 }  // namespace bt
 ````
 
@@ -785,6 +810,10 @@ struct Snapshot {
 };
 
 Snapshot poll();
+
+bool isPaused();
+void pause();
+void resume();
 
 }  // namespace bt
 ````
@@ -818,6 +847,30 @@ static constexpr bool    SERIAL_PLOTTER_DEMO = false;
 
 static constexpr uint8_t BOOT_BTN_PIN    = 0;
 static constexpr uint32_t BTN_DEBOUNCE_MS = 30;
+
+// ---- Rotary encoder (EC11) ----
+static constexpr uint8_t  ENC_PIN_A  = 32;
+static constexpr uint8_t  ENC_PIN_B  = 33;
+static constexpr uint8_t  ENC_PIN_SW = 4;
+static constexpr uint32_t ENC_SW_DEBOUNCE_MS = 25;
+static constexpr int32_t  ENC_STEPS_PER_DETENT = 4;   // try 2 if too coarse
+static constexpr int      ENC_VOL_STEP = 2;
+
+static volatile int32_t encDelta     = 0;
+static volatile uint8_t encLastState = 0;
+
+DRAM_ATTR static const int8_t ENC_TBL[16] = {
+     0, +1, -1,  0,
+    -1,  0,  0, +1,
+    +1,  0,  0, -1,
+     0, -1, +1,  0
+};
+
+static void IRAM_ATTR encoderIsr() {
+    const uint8_t cur = (uint8_t)((digitalRead(ENC_PIN_A) << 1) | digitalRead(ENC_PIN_B));
+    encDelta += ENC_TBL[(encLastState << 2) | cur];
+    encLastState = cur;
+}
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 PlayerUI ui;
@@ -864,6 +917,7 @@ static const uint8_t BEAT_GAIN[NUM_BANDS] = {
 
 static void updateVisualizer();
 static void pollBootButton(uint32_t now);
+static void pollEncoder(uint32_t now);
 static void announceMode(audio::Mode m);
 static void onConsoleChar(char c);
 static void feedUI();
@@ -875,6 +929,13 @@ void setup() {
     const bool rxOk = stream::begin();
 
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
+    pinMode(ENC_PIN_A,  INPUT_PULLUP);
+    pinMode(ENC_PIN_B,  INPUT_PULLUP);
+    pinMode(ENC_PIN_SW, INPUT_PULLUP);
+    encLastState = (uint8_t)((digitalRead(ENC_PIN_A) << 1) | digitalRead(ENC_PIN_B));
+    attachInterrupt(digitalPinToInterrupt(ENC_PIN_A), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_PIN_B), encoderIsr, CHANGE);
 
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
@@ -914,6 +975,7 @@ void loop() {
     const uint32_t now = millis();
 
     pollBootButton(now);
+    pollEncoder(now);
 
     static bool btInited = false;
     if (!btInited && now > 500) {
@@ -966,7 +1028,7 @@ static void feedUI() {
             for (int i = 0; i < NUM_BANDS; ++i)
                 uiLevels[i] = (uint8_t)((uint16_t)live[i] * 100u / 255u);
         }
-        ui.setPlaying(true);
+        ui.setPlaying(!(audio::btActive() && bt::isPaused()));
         if (!bt::poll().connected && !audio::btActive()) {
             if (!usbTitleSet) {
                 ui.setTrackInfo("USB STREAM", "playing");
@@ -1070,6 +1132,45 @@ static void updateVisualizer() {
             if (step == 0) step = 1;
             env[i] = (uint8_t)(env[i] - step);
             if (env[i] < t) env[i] = t;
+        }
+    }
+}
+
+static void pollEncoder(uint32_t now) {
+    noInterrupts();
+    const int32_t d = encDelta;
+    encDelta = 0;
+    interrupts();
+
+    if (d != 0) {
+        static int32_t accum = 0;
+        accum += d;
+        while (accum >= ENC_STEPS_PER_DETENT) {
+            accum -= ENC_STEPS_PER_DETENT;
+            int v = audio::volume() + ENC_VOL_STEP;
+            if (v > 100) v = 100;
+            audio::setVolume((uint8_t)v);
+        }
+        while (accum <= -ENC_STEPS_PER_DETENT) {
+            accum += ENC_STEPS_PER_DETENT;
+            int v = audio::volume() - ENC_VOL_STEP;
+            if (v < 0) v = 0;
+            audio::setVolume((uint8_t)v);
+        }
+    }
+
+    static bool     lastRaw   = true;
+    static bool     stable    = true;
+    static uint32_t changedAt = 0;
+    const bool raw = digitalRead(ENC_PIN_SW) != LOW;
+    if (raw != lastRaw) {
+        lastRaw   = raw;
+        changedAt = now;
+    } else if (raw != stable && (uint32_t)(now - changedAt) >= ENC_SW_DEBOUNCE_MS) {
+        stable = raw;
+        if (!stable && audio::btActive()) {      // press, Bluetooth only
+            if (bt::isPaused()) bt::resume();
+            else                bt::pause();
         }
     }
 }
@@ -1527,7 +1628,7 @@ private:
 
 namespace audio {
 
-enum class Source : uint32_t { NONE = 0, SERIAL = 1, BLUETOOTH = 2 };
+enum class Source : uint32_t { NONE = 0, USB_SERIAL = 1, BLUETOOTH = 2 };
 
 class SourceManager {
  public:
@@ -3180,13 +3281,13 @@ int main() {
     assert(!m.ready());
 
     // Successful acquisition.
-    assert(m.acquire(Source::SERIAL));
-    assert(m.owner() == Source::SERIAL);
+    assert(m.acquire(Source::USB_SERIAL));
+    assert(m.owner() == Source::USB_SERIAL);
     assert(!m.ready());
 
     // Second acquisition must fail.
     assert(!m.acquire(Source::BLUETOOTH));
-    assert(m.owner() == Source::SERIAL);
+    assert(m.owner() == Source::USB_SERIAL);
 
     // Ready after audio task start.
     m.setReady(true);
@@ -3201,13 +3302,13 @@ int main() {
     assert(m.acquire(Source::BLUETOOTH));
     assert(m.owner() == Source::BLUETOOTH);
 
-    // Serial cannot steal ownership.
-    assert(!m.acquire(Source::SERIAL));
+    // USB serial cannot steal ownership.
+    assert(!m.acquire(Source::USB_SERIAL));
     assert(m.owner() == Source::BLUETOOTH);
 
     // Failed startup: release immediately.
     m.release();
-    assert(m.acquire(Source::SERIAL));
+    assert(m.acquire(Source::USB_SERIAL));
 
     printf("test_ownership: PASS\n");
     return 0;

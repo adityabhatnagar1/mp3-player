@@ -15,4 +15,8 @@ struct Snapshot {
 
 Snapshot poll();
 
+bool isPaused();
+void pause();
+void resume();
+
 }  // namespace bt

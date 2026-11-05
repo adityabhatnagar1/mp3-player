@@ -13,6 +13,7 @@ BluetoothA2DPSink* g_sink       = nullptr;
 SemaphoreHandle_t  g_metaMutex = nullptr;
 
 volatile bool g_connected = false;
+volatile bool g_paused = false;
 volatile bool g_metaDirty = false;
 
 char g_title[96]  = {0};
@@ -30,9 +31,11 @@ void dataCallback(const uint8_t* data, uint32_t length) {
 void connectionCallback(esp_a2d_connection_state_t state, void* /*ptr*/) {
     if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
         g_connected = true;
+        g_paused = false;
         audio::btBegin();                    // rate supplied by sample-rate callback
     } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
         g_connected = false;
+        g_paused = false;
         audio::btEnd();
         if (g_metaMutex && xSemaphoreTake(g_metaMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             g_title[0]  = 0;
@@ -110,5 +113,9 @@ Snapshot poll() {
     }
     return s;
 }
+
+bool isPaused() { return g_paused; }
+void pause()    { if (g_sink) { g_sink->pause(); g_paused = true;  } }
+void resume()   { if (g_sink) { g_sink->play();  g_paused = false; } }
 
 }  // namespace bt
