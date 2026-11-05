@@ -8,7 +8,15 @@
 #endif
 
 #include <math.h>
+#include <string.h>
+
 #include "driver/i2s.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+
+#include "audio_levels.h"
+#include "stream_player.h"
 
 namespace audio {
 namespace {
@@ -18,6 +26,13 @@ constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
 constexpr int DMA_BUF_COUNT  = 8;
 constexpr int DMA_BUF_FRAMES = 256;
 constexpr int CHUNK_FRAMES   = DMA_BUF_FRAMES;
+
+static_assert(CHUNK_FRAMES <= sp::MAX_CHUNK_FRAMES, "render() chunk limit");
+static_assert((int)STREAM_IDLE      == (int)sp::IDLE,      "state enums must match");
+static_assert((int)STREAM_BUFFERING == (int)sp::BUFFERING, "state enums must match");
+static_assert((int)STREAM_PLAYING   == (int)sp::PLAYING,   "state enums must match");
+static_assert((int)STREAM_DRAINING  == (int)sp::DRAINING,  "state enums must match");
+static_assert(NUM_BANDS == viz::BANDS, "band count must match audio_levels.h");
 
 constexpr int TABLE_BITS = 10;
 constexpr int TABLE_SIZE = 1 << TABLE_BITS;
@@ -60,11 +75,27 @@ constexpr int32_t  FADEOUT_STEP    = ENV_MAX / (int32_t)FADEOUT_SAMPLES;
 // tau = 250 ms -> coeff = 32768 * exp(-1 / (0.250 * 44100)) ~= 32765
 constexpr int32_t  DECAY_COEFF = 32765;
 
+// ---- Commands: any task -> audio task (the audio task owns I2S + all playback state) ----
+enum CmdType : uint8_t { CMD_SET_MODE, CMD_STREAM_START, CMD_STREAM_END, CMD_STREAM_ABORT };
+struct Cmd {
+    uint8_t  type;
+    uint8_t  arg;       // Mode for CMD_SET_MODE, channel count for CMD_STREAM_START
+    uint16_t session;
+    uint32_t rate;
+};
+
+QueueHandle_t g_cmdQ = nullptr;
+
 volatile Mode     g_mode        = MODE_OFF;
 volatile uint32_t g_writeErrors = 0;
+volatile uint32_t g_vizStampMs  = 0;
 bool              g_started     = false;
+uint32_t          g_i2sRate     = SAMPLE_RATE_HZ;   // audio task only
 
 int16_t g_chunk[CHUNK_FRAMES * 2];
+
+sp::StreamPlayer       g_player;     // ring buffer lives here (static, never allocated at run time)
+viz::BandAnalyzer   g_analyzer;
 
 inline int16_t sineLookup(uint32_t phase) {
     const uint32_t idx  = phase >> (32 - TABLE_BITS);
@@ -76,6 +107,50 @@ inline int16_t sineLookup(uint32_t phase) {
 
 inline uint32_t phaseIncFor(uint32_t hz) {
     return (uint32_t)(((uint64_t)hz << 32) / SAMPLE_RATE_HZ);
+}
+
+// Audio task only.
+void setClock(uint32_t rate) {
+    if (rate == g_i2sRate) return;
+    i2s_zero_dma_buffer(I2S_PORT);
+    i2s_set_clk(I2S_PORT, rate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+    g_i2sRate = rate;
+}
+
+// Audio task only.
+void handleCommand(const Cmd& c) {
+    switch (c.type) {
+        case CMD_SET_MODE:
+            if (g_mode == MODE_STREAM) break;            // generators never run over a stream
+            if (c.arg != (uint8_t)MODE_STREAM) {
+                setClock(SAMPLE_RATE_HZ);                // synth phase increments assume 44.1 kHz
+                g_mode = (Mode)c.arg;
+            }
+            break;
+
+        case CMD_STREAM_START:
+            i2s_zero_dma_buffer(I2S_PORT);
+            setClock(c.rate);
+            g_analyzer.reset(c.rate);
+            g_vizStampMs = 0;
+            g_player.start(c.rate, c.arg, c.session);
+            g_mode = MODE_STREAM;
+            break;
+
+        case CMD_STREAM_END:
+            g_player.end();
+            break;
+
+        case CMD_STREAM_ABORT:
+            g_player.abort();
+            i2s_zero_dma_buffer(I2S_PORT);               // cut off what is already in the DMA queue
+            break;
+    }
+}
+
+bool post(const Cmd& c) {
+    if (!g_started || g_cmdQ == nullptr) return false;
+    return xQueueSend(g_cmdQ, &c, 0) == pdTRUE;
 }
 
 void audioTask(void*) {
@@ -91,102 +166,120 @@ void audioTask(void*) {
     Mode     lastMode        = MODE_OFF;
 
     for (;;) {
+        Cmd cmd;
+        while (xQueueReceive(g_cmdQ, &cmd, 0) == pdTRUE) handleCommand(cmd);
+
         const Mode m = g_mode;
 
-        // ---- Mode change ----
-        if (m != lastMode) {
-            if (m == MODE_TONE) {
-                phase           = 0;
-                phaseInc        = phaseIncFor(TONE_HZ);
-                env             = 0;
-                attackRemaining = ATTACK_SAMPLES;
-                envAttacking    = true;
-                fadeRemaining   = 0;
-                noteRemaining   = 0;
-                pendingAdvance  = false;
-            } else if (m == MODE_SCALE) {
-                seqPos = 0;
-                const Step& s = SCALE[0];
-                phase      = 0;
-                phaseInc   = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
-                env        = 0;
-                envAttacking = (s.note != NOTE_REST);
-                attackRemaining = envAttacking ? ATTACK_SAMPLES : 0;
-                fadeRemaining = 0;
-                noteRemaining = (uint32_t)s.ms * SAMPLE_RATE_HZ / 1000;
-                pendingAdvance = false;
-            } else { // MODE_OFF
-                if (env > 0) fadeRemaining = FADEOUT_SAMPLES;
-                pendingAdvance = false;
-                noteRemaining  = 0;
-                envAttacking   = false;
+        if (m == MODE_STREAM) {
+            // ---------------- streamed PCM (no synthesis runs) ----------------
+            if (lastMode != MODE_STREAM) {
+                env = 0; fadeRemaining = 0; attackRemaining = 0; noteRemaining = 0;
+                envAttacking = false; pendingAdvance = false; phaseInc = 0;
+                lastMode = MODE_STREAM;
             }
-            lastMode = m;
-        }
+            const int valid = g_player.render(g_chunk, CHUNK_FRAMES);
+            if (valid > 0 && g_analyzer.feed(g_chunk, valid)) g_vizStampMs = millis();
+            if (g_player.idle()) g_mode = MODE_OFF;       // finished, aborted or timed out
+        } else {
+            // ---------------- built-in generators (unchanged from Milestone 03) ----------------
 
-        // ---- Sample generation ----
-        for (int i = 0; i < CHUNK_FRAMES; ++i) {
-
-            // Envelope state machine
-            if (fadeRemaining > 0) {
-                env -= FADEOUT_STEP;
-                --fadeRemaining;
-                if (env <= 0 || fadeRemaining == 0) {
-                    env = 0;
+            // ---- Mode change ----
+            if (m != lastMode) {
+                if (m == MODE_TONE) {
+                    phase           = 0;
+                    phaseInc        = phaseIncFor(TONE_HZ);
+                    env             = 0;
+                    attackRemaining = ATTACK_SAMPLES;
+                    envAttacking    = true;
+                    fadeRemaining   = 0;
+                    noteRemaining   = 0;
+                    pendingAdvance  = false;
+                } else if (m == MODE_SCALE) {
+                    seqPos = 0;
+                    const Step& s = SCALE[0];
+                    phase      = 0;
+                    phaseInc   = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
+                    env        = 0;
+                    envAttacking = (s.note != NOTE_REST);
+                    attackRemaining = envAttacking ? ATTACK_SAMPLES : 0;
                     fadeRemaining = 0;
-                    if (pendingAdvance) {
-                        pendingAdvance = false;
-                        const Step& s = SCALE[seqPos];
-                        phase    = 0;
-                        phaseInc = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
-                        if (s.note != NOTE_REST) {
-                            env = 0;
-                            attackRemaining = ATTACK_SAMPLES;
-                            envAttacking = true;
-                        } else {
-                            envAttacking = false;
+                    noteRemaining = (uint32_t)s.ms * SAMPLE_RATE_HZ / 1000;
+                    pendingAdvance = false;
+                } else { // MODE_OFF
+                    if (env > 0) fadeRemaining = FADEOUT_SAMPLES;
+                    pendingAdvance = false;
+                    noteRemaining  = 0;
+                    envAttacking   = false;
+                }
+                lastMode = m;
+            }
+
+            // ---- Sample generation ----
+            for (int i = 0; i < CHUNK_FRAMES; ++i) {
+
+                // Envelope state machine
+                if (fadeRemaining > 0) {
+                    env -= FADEOUT_STEP;
+                    --fadeRemaining;
+                    if (env <= 0 || fadeRemaining == 0) {
+                        env = 0;
+                        fadeRemaining = 0;
+                        if (pendingAdvance) {
+                            pendingAdvance = false;
+                            const Step& s = SCALE[seqPos];
+                            phase    = 0;
+                            phaseInc = (s.note == NOTE_REST) ? 0 : phaseIncFor(NOTE_HZ[s.note]);
+                            if (s.note != NOTE_REST) {
+                                env = 0;
+                                attackRemaining = ATTACK_SAMPLES;
+                                envAttacking = true;
+                            } else {
+                                envAttacking = false;
+                            }
+                            noteRemaining = (uint32_t)s.ms * SAMPLE_RATE_HZ / 1000;
+                        } else if (m == MODE_OFF) {
+                            phaseInc = 0;
                         }
-                        noteRemaining = (uint32_t)s.ms * SAMPLE_RATE_HZ / 1000;
-                    } else if (m == MODE_OFF) {
-                        phaseInc = 0;
+                    }
+                } else if (envAttacking) {
+                    env += ATTACK_STEP;
+                    --attackRemaining;
+                    if (attackRemaining == 0 || env >= ENV_MAX) {
+                        env = ENV_MAX;
+                        envAttacking = false;
+                    }
+                } else if (env > 0) {
+                    if (m == MODE_SCALE) {          // piano-style decay
+                        env = (env * DECAY_COEFF) >> 15;
+                        if (env < 16) env = 0;
+                    }
+                    // MODE_TONE: hold env at ENV_MAX (steady tone)
+                }
+
+                // Note timer (SCALE only)
+                if (m == MODE_SCALE && noteRemaining > 0) {
+                    if (--noteRemaining == 0) {
+                        seqPos = (uint8_t)((seqPos + 1) % SEQ_LEN);
+                        pendingAdvance = true;
+                        fadeRemaining  = FADEOUT_SAMPLES;
                     }
                 }
-            } else if (envAttacking) {
-                env += ATTACK_STEP;
-                --attackRemaining;
-                if (attackRemaining == 0 || env >= ENV_MAX) {
-                    env = ENV_MAX;
-                    envAttacking = false;
-                }
-            } else if (env > 0) {
-                if (m == MODE_SCALE) {          // piano-style decay
-                    env = (env * DECAY_COEFF) >> 15;
-                    if (env < 16) env = 0;
-                }
-                // MODE_TONE: hold env at ENV_MAX (steady tone)
-            }
 
-            // Note timer (SCALE only)
-            if (m == MODE_SCALE && noteRemaining > 0) {
-                if (--noteRemaining == 0) {
-                    seqPos = (uint8_t)((seqPos + 1) % SEQ_LEN);
-                    pendingAdvance = true;
-                    fadeRemaining  = FADEOUT_SAMPLES;
+                // Output
+                int16_t out = 0;
+                if (env > 0 && phaseInc != 0) {
+                    const int32_t s = sineLookup(phase);
+                    out = (int16_t)((s * env) >> 15);
                 }
-            }
+                phase += phaseInc;
 
-            // Output
-            int16_t out = 0;
-            if (env > 0 && phaseInc != 0) {
-                const int32_t s = sineLookup(phase);
-                out = (int16_t)((s * env) >> 15);
+                g_chunk[2*i]     = out;
+                g_chunk[2*i + 1] = out;
             }
-            phase += phaseInc;
-
-            g_chunk[2*i]     = out;
-            g_chunk[2*i + 1] = out;
         }
 
+        // Blocks until a DMA buffer is free: this is what paces the whole loop.
         size_t written = 0;
         const esp_err_t err = i2s_write(I2S_PORT, g_chunk, sizeof(g_chunk),
                                         &written, portMAX_DELAY);
@@ -203,6 +296,9 @@ bool begin() {
         sineTable[i] = (int16_t)lroundf(
             (float)SINE_PEAK * sinf(2.0f * (float)M_PI * (float)i / (float)TABLE_SIZE));
     }
+
+    g_cmdQ = xQueueCreate(8, sizeof(Cmd));
+    if (g_cmdQ == nullptr) return false;
 
     i2s_config_t cfg = {};
     cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
@@ -232,17 +328,58 @@ bool begin() {
     }
     i2s_zero_dma_buffer(I2S_PORT);
 
-    if (xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 5, nullptr, 0) != pdPASS) {
+    g_started = true;    // set before the task starts so commands posted right away are accepted
+    if (xTaskCreatePinnedToCore(audioTask, "audio", 6144, nullptr, 5, nullptr, 0) != pdPASS) {
+        g_started = false;
         i2s_driver_uninstall(I2S_PORT);
         return false;
     }
-
-    g_started = true;
     return true;
 }
 
-void setMode(Mode m)   { g_mode = m; }
+void setMode(Mode m) {
+    Cmd c = {};
+    c.type = CMD_SET_MODE;
+    c.arg  = (uint8_t)m;
+    post(c);
+}
 Mode mode()            { return g_mode; }
 uint32_t writeErrors() { return g_writeErrors; }
+
+bool streamBegin(uint32_t rateHz, uint8_t channels, uint16_t session) {
+    if (rateHz < 8000 || rateHz > 48000 || channels < 1 || channels > 2) return false;
+    Cmd c = {};
+    c.type    = CMD_STREAM_START;
+    c.arg     = channels;
+    c.session = session;
+    c.rate    = rateHz;
+    return post(c);
+}
+void streamEnd()   { Cmd c = {}; c.type = CMD_STREAM_END;   post(c); }
+void streamAbort() { Cmd c = {}; c.type = CMD_STREAM_ABORT; post(c); }
+
+bool streamWrite(const uint8_t* data, uint32_t len) { return g_player.write(data, len); }
+
+StreamStatus streamStatus() {
+    const sp::Status s = g_player.status();
+    StreamStatus out;
+    out.state         = s.state;
+    out.session       = s.session;
+    out.underruns     = s.underruns;
+    out.fillBytes     = s.fill;
+    out.capacityBytes = s.capacity;
+    return out;
+}
+
+bool levels(uint8_t bands[NUM_BANDS]) {
+    if (g_player.status().state == sp::IDLE) return false;
+    const uint32_t age = millis() - g_vizStampMs;
+    if (g_vizStampMs == 0 || age > 120) {
+        for (int i = 0; i < NUM_BANDS; ++i) bands[i] = 0;    // buffering / underrun / silence
+    } else {
+        g_analyzer.read(bands);
+    }
+    return true;
+}
 
 }  // namespace audio

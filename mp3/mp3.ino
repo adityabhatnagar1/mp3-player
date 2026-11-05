@@ -1,6 +1,6 @@
 /*
- * Retro 128x64 OLED Audio Visualizer
- * Milestone 03 - PCM5102A I2S DAC (440 Hz test tone) + synthetic spectrum
+ * Retro 128x64 OLED Audio Visualizer + laptop-streamed MP3 player
+ * Milestone 04 - PCM5102A I2S DAC fed by PCM streamed over USB Serial
  *
  * Hardware:
  *   ESP32-WROOM-32 DevKit V1
@@ -9,13 +9,24 @@
  *   PCM5102A breakout (3-wire I2S, SCK tied to GND)
  *     BCK = GPIO27, LCK = GPIO25, DIN = GPIO26   (see audio_out.h)
  *
- * Visualizer code below is unchanged from Milestone 02.
- * Audio runs entirely in its own FreeRTOS task on core 0 (audio_out.cpp);
- * loop()/OLED rendering runs on core 1 and never touches I2S.
+ * Signal path:
+ *   laptop: play_mp3.py -> FFmpeg (MP3 -> s16le PCM) -> USB serial, 921600 baud
+ *   ESP32 : stream_rx.cpp  (UART task, core 0, framing + CRC + flow control)
+ *           stream_player.cpp (lock-free ring buffer + playback state machine)
+ *           audio_out.cpp  (audio task, core 0, I2S DMA)  -> PCM5102A
  *
- * Test tone control:
- *   - Serial monitor (115200): 't' toggle, '1' on, '0' off
- *   - BOOT button (GPIO0) on the DevKit: press to toggle
+ * Tasks:
+ *   audio       core 0, prio 5  owns I2S and all playback state
+ *   stream_rx   core 0, prio 4  owns Serial; the only producer into the ring
+ *   loopTask    core 1, prio 1  this file: OLED rendering + BOOT button, never touches I2S/Serial RX
+ *
+ * The OLED bars show the spectrum of the audio actually being played (10 Goertzel
+ * bands computed in the audio task). With no stream active, the original synthetic
+ * animation runs exactly as in Milestone 02/03.
+ *
+ * Built-in test generators (no laptop needed, only while no stream is active):
+ *   - Serial monitor (921600!): 's' scale, '1' 440 Hz, '0' off, 't' toggle tone, 'e' error count
+ *   - BOOT button (GPIO0): cycles OFF -> TONE -> SCALE -> OFF
  */
 
 #include <Arduino.h>
@@ -23,6 +34,7 @@
 #include <Wire.h>
 
 #include "audio_out.h"
+#include "stream_rx.h"
 
 // -----------------------------------------------------------------------------
 // Verified hardware configuration
@@ -31,8 +43,14 @@ static constexpr uint8_t SDA_PIN  = 21;
 static constexpr uint8_t SCL_PIN  = 22;
 static constexpr uint8_t I2C_ADDR = 0x3C;
 
-// Test tone: start enabled at boot? (toggle at runtime with 't' or BOOT button)
-static constexpr bool    TONE_ON_AT_BOOT = true;
+// Play the built-in scale at boot? Off by default: opening the COM port from the laptop
+// usually resets the ESP32, so the scale would play at the start of every playback.
+static constexpr bool    PLAY_SCALE_AT_BOOT = false;
+
+// The old 1 Hz sine for the Arduino Serial Plotter. Off: it would write ~30 text lines/s
+// onto the same UART that carries the binary protocol.
+static constexpr bool    SERIAL_PLOTTER_DEMO = false;
+
 static constexpr uint8_t BOOT_BTN_PIN    = 0;     // DevKit BOOT button, active low
 static constexpr uint32_t BTN_DEBOUNCE_MS = 30;
 
@@ -42,6 +60,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 // Visualizer geometry
 // -----------------------------------------------------------------------------
 static constexpr uint8_t NUM_BANDS = 10;
+static_assert(NUM_BANDS == audio::NUM_BANDS, "visualizer and audio analyzer band counts differ");
 
 static constexpr uint8_t BAR_X0    = 6;
 static constexpr uint8_t BAR_PITCH = 12;
@@ -75,6 +94,8 @@ static uint8_t  beatEnv      = 0;
 static uint8_t  beatTimer    = 0;
 static uint8_t  overallLevel = 0;
 static uint32_t lastFrame    = 0;
+static bool     liveViz      = false;   // bars driven by real audio
+static bool     vizBuffering = false;   // stream open but still filling the ring
 
 // -----------------------------------------------------------------------------
 // Integer-only sine table: 0..255, one full cycle across 64 entries
@@ -107,16 +128,19 @@ static const uint8_t BEAT_GAIN[NUM_BANDS] = {
 // -----------------------------------------------------------------------------
 static void updateVisualizer();
 static void renderFrame();
-static void pollAudioControls(uint32_t now);
-static void announceMode();
+static void pollBootButton(uint32_t now);
+static void announceMode(audio::Mode m);
+static void onConsoleChar(char c);
 
 // -----------------------------------------------------------------------------
 // Setup
-// Order: Serial -> OLED (unchanged M02 path) -> first frame -> I2S/audio task.
-// OLED comes first so the display is already up if audio init fails.
+// Order: stream receiver (configures Serial) -> OLED (unchanged M02 path) -> first frame
+//        -> I2S/audio task.
+// OLED comes before audio so the display is already up if audio init fails.
 // -----------------------------------------------------------------------------
 void setup() {
-    Serial.begin(115200);
+    stream::setConsoleHandler(onConsoleChar);
+    const bool rxOk = stream::begin();       // Serial.begin(921600) + receiver task
 
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
@@ -140,67 +164,82 @@ void setup() {
     renderFrame();
     lastFrame = millis();
 
-    // --- Audio (Milestone 03) ---
+    // --- Audio ---
     if (audio::begin()) {
-    audio::setMode(audio::MODE_SCALE);   // play scale on boot
-    Serial.println(F("[audio] I2S OK - playing scale"));
-    announceMode();
+        Serial.println(F("[audio] I2S OK"));
+        if (PLAY_SCALE_AT_BOOT) {
+            audio::setMode(audio::MODE_SCALE);
+            announceMode(audio::MODE_SCALE);
+        }
     } else {
         Serial.println(F("[audio] ERROR: I2S init failed (display continues)"));
     }
-
+    if (!rxOk) Serial.println(F("[stream] ERROR: receiver task failed to start"));
+    Serial.print(F("[stream] ready, "));
+    Serial.print(stream::BAUD);
+    Serial.println(F(" baud. Run play_mp3.py on the laptop."));
     Serial.println(F("[audio] 's'=scale '1'=440Hz '0'=off 't'=toggle, BOOT=cycle modes"));
 }
 
 // -----------------------------------------------------------------------------
-// Non-blocking frame scheduler (unchanged) + non-blocking tone controls
+// Non-blocking frame scheduler (unchanged) + non-blocking BOOT button
 // -----------------------------------------------------------------------------
 void loop() {
     const uint32_t now = millis();
 
-    pollAudioControls(now);   // was pollToneControls(now)
+    pollBootButton(now);
 
     if ((uint32_t)(now - lastFrame) < FRAME_INTERVAL_MS) {
         return;
     }
     lastFrame = now;
 
-    // Generate a 1 Hz sine wave for the Serial Plotter based on uptime
-    float plotterSine = sin(now * 2.0 * PI / 1000.0) * 100.0;
-    Serial.println(plotterSine);
+    if (SERIAL_PLOTTER_DEMO) {
+        // Generate a 1 Hz sine wave for the Serial Plotter based on uptime
+        float plotterSine = sin(now * 2.0 * PI / 1000.0) * 100.0;
+        Serial.println(plotterSine);
+    }
 
     updateVisualizer();
     renderFrame();
 }
 
 // -----------------------------------------------------------------------------
-// Tone controls: serial characters and BOOT button (debounced, no delay())
+// Built-in generator controls: console characters and BOOT button (debounced, no delay())
+// Both are ignored while a stream session is active.
 // -----------------------------------------------------------------------------
-static void announceMode() {
+static bool streamBusy() {
+    return audio::streamStatus().state != audio::STREAM_IDLE;
+}
+
+static void announceMode(audio::Mode m) {
+    if (streamBusy()) return;                 // keep the UART clean during playback
     Serial.print(F("[audio] mode: "));
-    switch (audio::mode()) {
-        case audio::MODE_OFF:   Serial.println(F("OFF"));      break;
-        case audio::MODE_TONE:  Serial.println(F("440 Hz"));   break;
-        case audio::MODE_SCALE: Serial.println(F("SCALE"));    break;
+    switch (m) {
+        case audio::MODE_OFF:    Serial.println(F("OFF"));      break;
+        case audio::MODE_TONE:   Serial.println(F("440 Hz"));   break;
+        case audio::MODE_SCALE:  Serial.println(F("SCALE"));    break;
+        case audio::MODE_STREAM: Serial.println(F("STREAM"));   break;
     }
 }
 
-static void pollAudioControls(uint32_t now) {
-    while (Serial.available() > 0) {
-        const int c = Serial.read();
-        if      (c == 's' || c == 'S') { audio::setMode(audio::MODE_SCALE); announceMode(); }
-        else if (c == '1')             { audio::setMode(audio::MODE_TONE);  announceMode(); }
-        else if (c == '0')             { audio::setMode(audio::MODE_OFF);   announceMode(); }
-        else if (c == 't' || c == 'T') {
-            audio::setMode(audio::mode() == audio::MODE_TONE ? audio::MODE_OFF
-                                                             : audio::MODE_TONE);
-            announceMode();
-        } else if (c == 'e' || c == 'E') {
-            Serial.print(F("[audio] i2s write errors: "));
-            Serial.println(audio::writeErrors());
-        }
+// Called from the stream_rx task for ASCII bytes that arrive while no session is active.
+static void onConsoleChar(char c) {
+    if      (c == 's' || c == 'S') { audio::setMode(audio::MODE_SCALE); announceMode(audio::MODE_SCALE); }
+    else if (c == '1')             { audio::setMode(audio::MODE_TONE);  announceMode(audio::MODE_TONE); }
+    else if (c == '0')             { audio::setMode(audio::MODE_OFF);   announceMode(audio::MODE_OFF); }
+    else if (c == 't' || c == 'T') {
+        const audio::Mode next = (audio::mode() == audio::MODE_TONE) ? audio::MODE_OFF
+                                                                     : audio::MODE_TONE;
+        audio::setMode(next);
+        announceMode(next);
+    } else if (c == 'e' || c == 'E') {
+        Serial.print(F("[audio] i2s write errors: "));
+        Serial.println(audio::writeErrors());
     }
+}
 
+static void pollBootButton(uint32_t now) {
     // BOOT button: OFF -> TONE -> SCALE -> OFF
     static bool     lastRaw   = true;
     static bool     stable    = true;
@@ -211,12 +250,14 @@ static void pollAudioControls(uint32_t now) {
         changedAt = now;
     } else if (raw != stable && (uint32_t)(now - changedAt) >= BTN_DEBOUNCE_MS) {
         stable = raw;
-        if (!stable) {
+        if (!stable && !streamBusy()) {
             const auto m = audio::mode();
-            if      (m == audio::MODE_OFF)   audio::setMode(audio::MODE_TONE);
-            else if (m == audio::MODE_TONE)  audio::setMode(audio::MODE_SCALE);
-            else                              audio::setMode(audio::MODE_OFF);
-            announceMode();
+            audio::Mode next;
+            if      (m == audio::MODE_OFF)   next = audio::MODE_TONE;
+            else if (m == audio::MODE_TONE)  next = audio::MODE_SCALE;
+            else                             next = audio::MODE_OFF;
+            audio::setMode(next);
+            announceMode(next);
         }
     }
 }
@@ -225,37 +266,50 @@ static void pollAudioControls(uint32_t now) {
 // Synthetic signal generation, envelope smoothing, peak hold
 // -----------------------------------------------------------------------------
 static void updateVisualizer() {
-    // Slow beat pulse, roughly 1.8 Hz at 25-30 FPS.
-    if (beatTimer > 0) {
-        --beatTimer;
-    } else {
-        beatTimer = BEAT_PERIOD_FRAMES;
-        beatEnv   = 255;
-    }
-    if (beatEnv > BEAT_DECAY) {
-        beatEnv -= BEAT_DECAY;
-    } else {
-        beatEnv = 0;
+    // Real spectrum while a stream session is active, otherwise the synthetic animation.
+    uint8_t live[NUM_BANDS];
+    liveViz      = audio::levels(live);
+    vizBuffering = liveViz && (audio::streamStatus().state == audio::STREAM_BUFFERING);
+
+    if (!liveViz) {
+        // Slow beat pulse, roughly 1.8 Hz at 25-30 FPS.
+        if (beatTimer > 0) {
+            --beatTimer;
+        } else {
+            beatTimer = BEAT_PERIOD_FRAMES;
+            beatEnv   = 255;
+        }
+        if (beatEnv > BEAT_DECAY) {
+            beatEnv -= BEAT_DECAY;
+        } else {
+            beatEnv = 0;
+        }
     }
 
     uint16_t sum = 0;
 
     for (uint8_t i = 0; i < NUM_BANDS; ++i) {
-        // Independent phase accumulators.
-        phase[i] = (uint16_t)(phase[i] + BAND_SPEED[i]);
+        uint16_t target;
 
-        // 16-bit Galois LFSR -> deterministic per-band noise.
-        const uint16_t lsb = lfsr[i] & 1u;
-        lfsr[i] = (uint16_t)((lfsr[i] >> 1) ^ (lsb ? 0xB400u : 0x0000u));
+        if (liveViz) {
+            target = live[i];                      // 0..255 from the PCM being played
+        } else {
+            // Independent phase accumulators.
+            phase[i] = (uint16_t)(phase[i] + BAND_SPEED[i]);
 
-        const uint8_t s = SINE_TABLE[(phase[i] >> 10) & 63u];
-        const uint8_t n = (uint8_t)(lfsr[i] & 0xFFu);
+            // 16-bit Galois LFSR -> deterministic per-band noise.
+            const uint16_t lsb = lfsr[i] & 1u;
+            lfsr[i] = (uint16_t)((lfsr[i] >> 1) ^ (lsb ? 0xB400u : 0x0000u));
 
-        // 75% periodic movement, 25% noise.
-        const uint16_t base = ((uint16_t)s * 3u + n) >> 2;
-        uint16_t target = (base * BAND_GAIN[i]) >> 8;
-        target += ((uint16_t)beatEnv * BEAT_GAIN[i]) >> 8;
-        if (target > 255u) target = 255u;
+            const uint8_t s = SINE_TABLE[(phase[i] >> 10) & 63u];
+            const uint8_t n = (uint8_t)(lfsr[i] & 0xFFu);
+
+            // 75% periodic movement, 25% noise.
+            const uint16_t base = ((uint16_t)s * 3u + n) >> 2;
+            target = (base * BAND_GAIN[i]) >> 8;
+            target += ((uint16_t)beatEnv * BEAT_GAIN[i]) >> 8;
+            if (target > 255u) target = 255u;
+        }
 
         const uint8_t t = (uint8_t)target;
 
@@ -303,7 +357,7 @@ static void renderFrame() {
     // Header ---------------------------------------------------------------
     u8g2.setFont(u8g2_font_5x7_tr);
     u8g2.drawStr(4, 8, "SPECTRUM");
-    u8g2.drawStr(86, 8, "SYNTH");
+    u8g2.drawStr(86, 8, liveViz ? (vizBuffering ? "BUFF" : "LIVE") : "SYNTH");
     u8g2.drawHLine(2, 10, 124);
 
     // Tiny three-bar level meter.
