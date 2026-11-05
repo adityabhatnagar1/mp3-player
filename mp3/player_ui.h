@@ -61,6 +61,7 @@ private:
     uint8_t vizTarget_[10] = {0};
     float   vizLevel_[10]  = {0.0f};
     float   vizPeak_[10]   = {0.0f};
+    float   beat_          = 0.0f;   // smoothed bass energy 0..1, drives mascot bounce
 
     void enterScreen(UIScreen s);
     UIScreen computeAutoScreen() const;
@@ -73,17 +74,17 @@ private:
     void renderNoMetadata(bool paused);
     void renderIdle();
     void drawStatusBar(bool paused);
-    void drawMochi(int x, int y, uint8_t frame);
+    void drawMascot(int x, int y, uint8_t face, bool sway);
     void drawBluetoothIcon(int x, int y, uint32_t now);
     void drawPlayPauseIcon(int x, int y, bool playing);
     void drawVisualizer(int baseY, int maxH, bool active, uint32_t now);
     void drawMarquee(int x, int baseline, int availW,
                      const char* text, int16_t w, float scroll,
                      const uint8_t* font);
-    uint8_t pickMochiFrame(uint32_t now) const;
+    uint8_t pickFace(uint32_t now) const;
     void drawEntryWipe();
 
-    static const uint8_t mochi_frames_[4][20];
+    static const uint8_t mascot_[8][32];
 };
 
 #endif
