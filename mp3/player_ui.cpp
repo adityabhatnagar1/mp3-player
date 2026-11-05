@@ -180,8 +180,20 @@ uint8_t PlayerUI::pickMochiFrame(uint32_t now) const {
 }
 
 void PlayerUI::drawStatusBar(bool paused) {
+    // Cyber/aesthetic top border line
+    u8g2_->drawHLine(0, 11, SCREEN_W);
+
     if (hasTitle_ || hasArtist_) drawPlayPauseIcon(2, 2, !paused);
     if (btConnected_)            drawBluetoothIcon(SCREEN_W - 9, 2, millis());
+
+    // Anime/Phone style volume signal bars right before the BT icon
+    int vBars = (lastVol_ + 10) / 20; // Maps 0-100 to 0-5 bars
+    for (int i = 0; i < 5; ++i) {
+        int h = 2 + i; // Heights: 2, 3, 4, 5, 6 px
+        int bx = SCREEN_W - 15 - (4 - i) * 3;
+        if (i < vBars) u8g2_->drawBox(bx, 9 - h, 2, h);
+        else           u8g2_->drawFrame(bx, 9 - h, 2, h);
+    }
 }
 
 void PlayerUI::drawPlayPauseIcon(int x, int y, bool playing) {
@@ -254,6 +266,7 @@ void PlayerUI::render() {
         case UIScreen::IDLE:        renderIdle();             break;
     }
     if (screen_ != UIScreen::BOOT) drawEntryWipe();
+    drawOverlays();
 }
 
 void PlayerUI::renderBoot() {
@@ -347,4 +360,60 @@ void PlayerUI::renderIdle() {
     const char* hint = "connect phone";
     int16_t wh = u8g2_->getUTF8Width(hint);
     u8g2_->drawUTF8((SCREEN_W - wh) / 2, 58, hint);
+}
+
+void PlayerUI::setVolumeLevel(uint8_t vol) { lastVol_ = vol; }
+void PlayerUI::showVolumeOverlay(uint8_t vol) { lastVol_ = vol; overlayVolMs_ = millis(); }
+void PlayerUI::triggerPlayPause(bool playing) { overlayPlaying_ = playing; overlayPlayPauseMs_ = millis(); }
+
+void PlayerUI::drawOverlays() {
+    uint32_t now = millis();
+
+    // 1. Play/Pause Cyber/Anime Burst Overlay
+    if (overlayPlayPauseMs_ > 0 && (now - overlayPlayPauseMs_) < 1200) {
+        float p = (now - overlayPlayPauseMs_) / 1200.0f;
+        // Expands sharply, collapses slowly
+        int h = (p < 0.1f) ? (int)(p * 10 * 24) : ((p > 0.8f) ? (int)((1.0f - p) * 5 * 24) : 24);
+        int y = (SCREEN_H - h) / 2;
+
+        u8g2_->setDrawColor(0);
+        u8g2_->drawBox(0, y, SCREEN_W, h); // Mask background
+        u8g2_->setDrawColor(1);
+        u8g2_->drawHLine(0, y, SCREEN_W);
+        u8g2_->drawHLine(0, y + h, SCREEN_W);
+
+        if (h >= 16) {
+            u8g2_->setFont(UI_FONT_TITLE);
+            const char* txt = overlayPlaying_ ? ">> P L A Y" : "|| P A U S E";
+            int tw = u8g2_->getUTF8Width(txt);
+            // Thick Evangelion-style emphasis blocks on the sides
+            u8g2_->drawBox(0, y + 4, (SCREEN_W - tw)/2 - 4, 16);
+            u8g2_->drawBox((SCREEN_W + tw)/2 + 4, y + 4, SCREEN_W, 16);
+            u8g2_->drawUTF8((SCREEN_W - tw) / 2, y + 16, txt);
+        }
+    }
+
+    // 2. Volume Slide-in Overlay
+    if (overlayVolMs_ > 0 && (now - overlayVolMs_) < 1500) {
+        float p = (now - overlayVolMs_) / 1500.0f;
+        // Slide in from bottom edge
+        int y = (p < 0.1f) ? SCREEN_H - (int)(p * 10 * 16) : ((p > 0.8f) ? SCREEN_H - (int)((1.0f - p) * 5 * 16) : SCREEN_H - 16);
+
+        u8g2_->setDrawColor(0);
+        u8g2_->drawBox(0, y, SCREEN_W, 16);
+        u8g2_->setDrawColor(1);
+        u8g2_->drawHLine(0, y, SCREEN_W);
+
+        u8g2_->setFont(UI_FONT_TITLE);
+        u8g2_->drawStr(4, y + 12, "VOL");
+
+        // Futuristic diagonal segmented blocks
+        int maxBars = 15;
+        int activeBars = (lastVol_ * maxBars) / 100;
+        for (int i = 0; i < maxBars; ++i) {
+            int bx = 32 + i * 6;
+            if (i < activeBars) u8g2_->drawBox(bx, y + 4, 4, 8);
+            else                u8g2_->drawFrame(bx, y + 4, 4, 8);
+        }
+    }
 }

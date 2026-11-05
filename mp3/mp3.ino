@@ -191,7 +191,7 @@ static void processBtSnapshot() {
 
 static void feedUI() {
     static bool usbTitleSet = false;
-
+    ui.setVolumeLevel(audio::volume());
     uint8_t uiLevels[NUM_BANDS];
     memset(uiLevels, 0, sizeof(uiLevels));
 
@@ -327,12 +327,16 @@ static void pollEncoder(uint32_t now) {
             int v = audio::volume() + ENC_VOL_STEP;
             if (v > 100) v = 100;
             audio::setVolume((uint8_t)v);
+            if (audio::btActive()) bt::setVolume((uint8_t)v); // Sync to phone
+            ui.showVolumeOverlay((uint8_t)v);                 // Pop UI overlay
         }
         while (accum <= -ENC_STEPS_PER_DETENT) {
             accum += ENC_STEPS_PER_DETENT;
             int v = audio::volume() - ENC_VOL_STEP;
             if (v < 0) v = 0;
             audio::setVolume((uint8_t)v);
+            if (audio::btActive()) bt::setVolume((uint8_t)v); // Sync to phone
+            ui.showVolumeOverlay((uint8_t)v);                 // Pop UI overlay
         }
     }
 
@@ -345,9 +349,9 @@ static void pollEncoder(uint32_t now) {
         changedAt = now;
     } else if (raw != stable && (uint32_t)(now - changedAt) >= ENC_SW_DEBOUNCE_MS) {
         stable = raw;
-        if (!stable && audio::btActive()) {      // press, Bluetooth only
-            if (bt::isPaused()) bt::resume();
-            else                bt::pause();
+        if (!stable && audio::btActive()) {      
+            if (bt::isPaused()) { bt::resume(); ui.triggerPlayPause(true);  }
+            else                { bt::pause();  ui.triggerPlayPause(false); }
         }
     }
 }

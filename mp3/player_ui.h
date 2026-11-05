@@ -15,6 +15,9 @@ enum class UIScreen : uint8_t {
 
 class PlayerUI {
 public:
+    void setVolumeLevel(uint8_t vol);
+    void showVolumeOverlay(uint8_t vol);
+    void triggerPlayPause(bool playing);
     void begin(U8G2* display);
     void update();
 
@@ -30,6 +33,12 @@ public:
     UIScreen currentScreen() const { return screen_; }
 
 private:
+    uint32_t overlayVolMs_ = 0;
+    uint32_t overlayPlayPauseMs_ = 0;
+    uint8_t  lastVol_ = 70;
+    bool     overlayPlaying_ = false;
+
+    void drawOverlays();
     U8G2* u8g2_ = nullptr;
 
     UIScreen screen_ = UIScreen::BOOT;

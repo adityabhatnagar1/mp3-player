@@ -3,6 +3,8 @@
 
 namespace bt {
 
+void setVolume(uint8_t vol);
+
 bool begin();
 void end();
 

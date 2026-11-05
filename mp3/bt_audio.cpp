@@ -69,6 +69,14 @@ void sampleRateCallback(uint16_t rate) {
 
 }  // namespace
 
+void setVolume(uint8_t vol) {
+    if (g_sink) {
+        uint8_t btVol = (uint8_t)((uint16_t)vol * 127 / 100);
+        g_sink->set_volume(btVol);
+    }
+}
+
+
 bool begin() {
     if (g_sink) return true;
 
